@@ -51,6 +51,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        QueueStore.applyV12Defaults(this);
         setContentView(buildUi());
         refresh();
     }
@@ -184,7 +185,7 @@ public class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        TextView footer = text("V1.1 works through Android’s Accessibility API on the Amazon Shopping app. Use Amazon’s Share button to add products while browsing. Product names are saved from the share data or captured from the product page when first opened.", 12, false);
+        TextView footer = text("V1.2 works through Android’s Accessibility API on the Amazon Shopping app. It now distinguishes already-purchased items, returns to Invite Helper after a completed run, and avoids duplicate advances that could skip queue items.", 12, false);
         footer.setPadding(0, dp(16), 0, 0);
         root.addView(footer);
         return scroller;
@@ -201,7 +202,8 @@ public class MainActivity extends Activity {
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
             return;
         }
-        int index = QueueStore.getCurrentIndex(this);
+        boolean wasRunning = QueueStore.isRunning(this);
+        int index = wasRunning ? QueueStore.getCurrentIndex(this) : 0;
         if (index < 0 || index >= items.size()) index = 0;
         QueueStore.setCurrentIndex(this, index);
         QueueStore.setPaused(this, false);
@@ -280,6 +282,7 @@ public class MainActivity extends Activity {
             case REQUESTED: return "Invitation requested";
             case AVAILABLE: return "AVAILABLE TO BUY";
             case NO_INVITE_CONTROL: return "No invitation control found";
+            case PURCHASED: return "Already purchased";
             case ERROR: return "Check failed";
             default: return "Pending";
         }
@@ -289,6 +292,7 @@ public class MainActivity extends Activity {
         switch (status) {
             case AVAILABLE: return Color.rgb(0, 125, 70);
             case REQUESTED: return Color.rgb(35, 95, 175);
+            case PURCHASED: return Color.rgb(95, 95, 95);
             case ERROR: return Color.rgb(185, 35, 35);
             case NO_INVITE_CONTROL: return Color.DKGRAY;
             default: return Color.rgb(130, 90, 0);

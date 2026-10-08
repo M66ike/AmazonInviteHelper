@@ -39,7 +39,10 @@ public class InviteAccessibilityService extends AccessibilityService {
     private long requestClickedAt = 0L;
     private long lastProcessAt = 0L;
     private boolean processingScheduled = false;
-    private static final int MAX_SCROLLS = 14;
+    private boolean advanceScheduled = false;
+    private long settleUntil = 0L;
+    private int itemGeneration = 0;
+    private static final int MAX_SCROLLS = 18;
 
     @Override
     public void onServiceConnected() {
@@ -97,20 +100,33 @@ public class InviteAccessibilityService extends AccessibilityService {
     }
 
     private void beginItem(int index, ProductItem item) {
+        itemGeneration++;
+        final int generation = itemGeneration;
         workingIndex = index;
         scrollAttempts = 0;
         clickedRequest = false;
         requestClickedAt = 0L;
+        advanceScheduled = false;
         openedAt = System.currentTimeMillis();
+        // Amazon can briefly leave the previous product's accessibility tree in place
+        // while a new deep link is loading. Do not inspect it until the new page settles.
+        settleUntil = openedAt + 2300L;
         QueueStore.setCurrentIndex(this, index);
-        updateOverlay();
+        updateOverlay("Opening item " + (index + 1) + "…");
         openAmazon(item.url);
-        handler.postDelayed(() -> scheduleProcess(0), 1350);
+        handler.postDelayed(() -> {
+            if (generation == itemGeneration && QueueStore.isRunning(this)) scheduleProcess(0);
+        }, 2400);
     }
 
     private void processCurrentScreen() {
         if (!QueueStore.isRunning(this) || QueueStore.isPaused(this)) return;
+        if (advanceScheduled) return;
         long now = System.currentTimeMillis();
+        if (now < settleUntil) {
+            scheduleProcess(Math.max(200L, settleUntil - now + 80L));
+            return;
+        }
         if (now - lastProcessAt < 300) return;
         lastProcessAt = now;
 
@@ -140,17 +156,28 @@ public class InviteAccessibilityService extends AccessibilityService {
 
         if (scan.productTitle != null && !scan.productTitle.isEmpty()) {
             ProductItem current = items.get(index);
-            if (current.label == null || current.label.trim().isEmpty()) {
+            if (isPlaceholderLabel(current.label)) {
                 current.label = scan.productTitle;
                 QueueStore.save(this, items);
                 notifyChanged();
             }
         }
 
+        // Strong terminal states are checked before availability. This prevents an
+        // already-purchased/requested page from being misread because Amazon keeps
+        // other hidden or stale accessibility text around during navigation.
+        if (scan.purchased) {
+            markAndAdvance(ProductItem.Status.PURCHASED, "Already purchased");
+            recycleScan(scan);
+            root.recycle();
+            return;
+        }
+
         // A requested page contains the sentence "If invited to purchase...".
         // Always give the explicit requested state priority over any availability wording.
         if (scan.requested) {
             markAndAdvance(ProductItem.Status.REQUESTED, "Invitation already requested");
+            recycleScan(scan);
             root.recycle();
             return;
         }
@@ -165,6 +192,7 @@ public class InviteAccessibilityService extends AccessibilityService {
             } else {
                 advanceAfter(1200);
             }
+            recycleScan(scan);
             root.recycle();
             return;
         }
@@ -172,6 +200,7 @@ public class InviteAccessibilityService extends AccessibilityService {
         if (scan.requestNode != null) {
             if (!QueueStore.autoRequest(this)) {
                 updateOverlay("Request invite found — auto request is off");
+                recycleScan(scan);
                 root.recycle();
                 return;
             }
@@ -187,6 +216,7 @@ public class InviteAccessibilityService extends AccessibilityService {
                 } else {
                     handler.postDelayed(() -> scheduleProcess(0), 1200);
                 }
+                recycleScan(scan);
                 root.recycle();
                 return;
             }
@@ -196,16 +226,18 @@ public class InviteAccessibilityService extends AccessibilityService {
             } else {
                 scheduleProcess(800);
             }
+            recycleScan(scan);
             root.recycle();
             return;
         }
 
+        recycleScan(scan);
         if (scrollAttempts < MAX_SCROLLS) {
             scrollAttempts++;
             updateOverlay("Scanning… scroll " + scrollAttempts + "/" + MAX_SCROLLS);
             boolean scrolled = scrollForward(root);
             if (!scrolled) performSwipeUp();
-            handler.postDelayed(() -> scheduleProcess(0), 650);
+            handler.postDelayed(() -> scheduleProcess(0), 800);
         } else {
             markAndAdvance(ProductItem.Status.NO_INVITE_CONTROL, "No invitation control found");
         }
@@ -224,30 +256,41 @@ public class InviteAccessibilityService extends AccessibilityService {
             AccessibilityNodeInfo n = q.removeFirst();
             String text = combinedText(n).toLowerCase(Locale.ROOT);
 
-            // Only strong, account-specific wording counts as AVAILABLE.
-            // Do not match generic "invited to purchase" because the requested state
-            // itself says "If invited to purchase...".
-            if (containsAny(text,
-                    "available for you to buy",
-                    "available for you to purchase",
-                    "you have been invited to purchase",
-                    "your invitation is ready",
-                    "congratulations, you're invited",
-                    "congratulations, you’re invited")) {
-                result.available = true;
-            }
-            if (containsAny(text,
-                    "invitation requested",
-                    "invitation requested, thanks",
-                    "you'll get an email with a link that's valid for 72 hours",
-                    "you’ll get an email with a link that’s valid for 72 hours")) {
-                result.requested = true;
-            }
-            if (result.requestNode == null && containsAny(text, "request invite", "request invitation")) {
-                result.requestNode = AccessibilityNodeInfo.obtain(n);
+            boolean visible = isVisibleOnScreen(n);
+            if (visible) {
+                if (containsAny(text,
+                        "thanks for shopping with us",
+                        "you purchased this item",
+                        "you last purchased this item",
+                        "you bought this item")) {
+                    result.purchased = true;
+                }
+
+                // Only strong, account-specific wording counts as AVAILABLE.
+                // Do not match generic "invited to purchase" because the requested state
+                // itself says "If invited to purchase...".
+                if (containsAny(text,
+                        "available for you to buy",
+                        "available for you to purchase",
+                        "you have been invited to purchase",
+                        "your invitation is ready",
+                        "congratulations, you're invited",
+                        "congratulations, you’re invited")) {
+                    result.available = true;
+                }
+                if (containsAny(text,
+                        "invitation requested",
+                        "invitation requested, thanks",
+                        "you'll get an email with a link that's valid for 72 hours",
+                        "you’ll get an email with a link that’s valid for 72 hours")) {
+                    result.requested = true;
+                }
+                if (result.requestNode == null && containsAny(text, "request invite", "request invitation")) {
+                    result.requestNode = AccessibilityNodeInfo.obtain(n);
+                }
             }
 
-            if (scrollAttempts <= 2 && n.getText() != null) {
+            if (visible && scrollAttempts <= 2 && n.getText() != null) {
                 String raw = n.getText().toString().replace('\n', ' ').replaceAll("\\s+", " " ).trim();
                 if (looksLikeProductTitle(raw)) {
                     Rect bounds = new Rect();
@@ -307,6 +350,30 @@ public class InviteAccessibilityService extends AccessibilityService {
     private boolean containsAny(String text, String... needles) {
         for (String n : needles) if (text.contains(n)) return true;
         return false;
+    }
+
+    private boolean isVisibleOnScreen(AccessibilityNodeInfo node) {
+        if (node == null || !node.isVisibleToUser()) return false;
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+        if (r.isEmpty()) return false;
+        int w = getResources().getDisplayMetrics().widthPixels;
+        int h = getResources().getDisplayMetrics().heightPixels;
+        return r.right > 0 && r.left < w && r.bottom > 0 && r.top < h;
+    }
+
+    private boolean isPlaceholderLabel(String label) {
+        if (label == null) return true;
+        String s = label.trim();
+        return s.isEmpty() || s.equalsIgnoreCase("Share Item") || s.equalsIgnoreCase("Share") ||
+                s.equalsIgnoreCase("Amazon item") || s.startsWith("Amazon item —");
+    }
+
+    private void recycleScan(ScanResult scan) {
+        if (scan != null && scan.requestNode != null) {
+            try { scan.requestNode.recycle(); } catch (Exception ignored) {}
+            scan.requestNode = null;
+        }
     }
 
     private boolean clickNode(AccessibilityNodeInfo node) {
@@ -370,12 +437,13 @@ public class InviteAccessibilityService extends AccessibilityService {
     }
 
     private void markAndAdvance(ProductItem.Status status, String overlayMessage) {
+        if (advanceScheduled) return;
         ArrayList<ProductItem> items = QueueStore.load(this);
         int index = QueueStore.getCurrentIndex(this);
         if (index >= 0 && index < items.size()) mark(items, index, status);
         updateOverlay(overlayMessage);
         notifyChanged();
-        advanceAfter(850);
+        advanceAfter(1000);
     }
 
     private void mark(ArrayList<ProductItem> items, int index, ProductItem.Status status) {
@@ -386,28 +454,54 @@ public class InviteAccessibilityService extends AccessibilityService {
     }
 
     private void advanceAfter(long delay) {
+        if (advanceScheduled) return;
+        advanceScheduled = true;
+        final int expectedIndex = QueueStore.getCurrentIndex(this);
+        final int generation = itemGeneration;
         handler.postDelayed(() -> {
-            if (!QueueStore.isRunning(this) || QueueStore.isPaused(this)) return;
+            if (!QueueStore.isRunning(this) || QueueStore.isPaused(this)) {
+                advanceScheduled = false;
+                return;
+            }
+            // Ignore duplicate/stale callbacks from the previous product. These were
+            // the main cause of every-other-item style queue skipping.
+            if (generation != itemGeneration || QueueStore.getCurrentIndex(this) != expectedIndex) {
+                advanceScheduled = false;
+                return;
+            }
             ArrayList<ProductItem> items = QueueStore.load(this);
-            int next = QueueStore.getCurrentIndex(this) + 1;
+            int next = expectedIndex + 1;
             if (next >= items.size()) {
+                advanceScheduled = false;
                 finishRun("Queue complete");
                 return;
             }
             QueueStore.setCurrentIndex(this, next);
             notifyChanged();
-            // Close the current product page before opening the next queued item.
             performGlobalAction(GLOBAL_ACTION_BACK);
-            handler.postDelayed(() -> beginItem(next, items.get(next)), 420);
+            handler.postDelayed(() -> {
+                ArrayList<ProductItem> latest = QueueStore.load(this);
+                if (QueueStore.isRunning(this) && next < latest.size()) beginItem(next, latest.get(next));
+            }, 700);
         }, delay);
     }
 
     private void finishRun(String message) {
         QueueStore.setRunning(this, false);
         QueueStore.setPaused(this, false);
+        advanceScheduled = false;
         updateOverlay(message);
         notifyChanged();
-        handler.postDelayed(this::hideOverlay, 2200);
+        handler.postDelayed(this::returnToHelper, 450);
+        handler.postDelayed(this::hideOverlay, 1800);
+    }
+
+    private void returnToHelper() {
+        try {
+            Intent i = new Intent(this, MainActivity.class);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            startActivity(i);
+        } catch (Exception ignored) {}
     }
 
     private void openAmazon(String url) {
@@ -515,6 +609,7 @@ public class InviteAccessibilityService extends AccessibilityService {
     private static final class ScanResult {
         boolean available = false;
         boolean requested = false;
+        boolean purchased = false;
         String productTitle = "";
         AccessibilityNodeInfo requestNode = null;
     }

@@ -143,9 +143,22 @@ public final class QueueStore {
         if (value == null) return "";
         String s = value.replace('\r', ' ').replace('\n', ' ').replaceAll("\\s+", " ").trim();
         if (s.length() > 180) s = s.substring(0, 180).trim();
-        if (s.equalsIgnoreCase("Amazon") || s.equalsIgnoreCase("Amazon.co.uk")) return "";
+        if (s.equalsIgnoreCase("Amazon") || s.equalsIgnoreCase("Amazon.co.uk") ||
+                s.equalsIgnoreCase("Share Item") || s.equalsIgnoreCase("Share") ||
+                s.equalsIgnoreCase("Amazon Shopping")) return "";
         if (s.startsWith("http://") || s.startsWith("https://")) return "";
         return s;
+    }
+
+
+    public static void applyV12Defaults(Context c) {
+        SharedPreferences p = prefs(c);
+        if (p.getInt("defaults_version", 0) < 12) {
+            p.edit()
+                    .putBoolean("stop_on_available", false)
+                    .putInt("defaults_version", 12)
+                    .apply();
+        }
     }
 
     public static void setCurrentIndex(Context c, int index) {
@@ -177,7 +190,7 @@ public final class QueueStore {
     }
 
     public static boolean stopOnAvailable(Context c) {
-        return prefs(c).getBoolean("stop_on_available", true);
+        return prefs(c).getBoolean("stop_on_available", false);
     }
 
     public static void setAutoRequest(Context c, boolean value) {

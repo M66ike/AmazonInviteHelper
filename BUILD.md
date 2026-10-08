@@ -1,15 +1,7 @@
 # Build
 
-The project is configured for GitHub Actions and Android Gradle builds.
+The included GitHub Actions workflow builds a debug APK with Java 17, Android SDK 37 and Gradle 9.7.
 
-Debug APK command:
+Run `gradle assembleDebug` from the project root after installing the required Android SDK components.
 
-```bash
-gradle assembleDebug
-```
-
-Output:
-
-`app/build/outputs/apk/debug/app-debug.apk`
-
-App version: 1.1 (versionCode 2)
+APK output: `app/build/outputs/apk/debug/app-debug.apk`

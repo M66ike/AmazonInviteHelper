@@ -10,6 +10,7 @@ public class ProductItem {
         REQUESTED,
         AVAILABLE,
         NO_INVITE_CONTROL,
+        PURCHASED,
         ERROR
     }
 
