@@ -24,7 +24,11 @@ import android.widget.Toast;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class InviteAccessibilityService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -56,11 +60,26 @@ public class InviteAccessibilityService extends AccessibilityService {
 
     private static final int MAX_SCROLLS = 18;
 
+    // Multi-account navigation (v1.5). Account rows are located by email text,
+    // never by a fixed row position because Amazon reorders the list after a switch.
+    private static final Pattern EMAIL_PATTERN = Pattern.compile(
+            "([A-Z0-9._%+-]+)\\s*@\\s*([A-Z0-9-]+(?:\\s*\\.\\s*[A-Z0-9-]+)+)",
+            Pattern.CASE_INSENSITIVE);
+    private boolean accountFlowScheduled = false;
+    private int accountSwitchScrolls = 0;
+    private int accountNavAttempts = 0;
+    private long accountSwitchClickedAt = 0L;
+    private String accountSwitchTarget = "";
+    private int discoveryNoNewPasses = 0;
+    private int discoveryScrolls = 0;
+
     @Override
     public void onServiceConnected() {
         super.onServiceConnected();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        if (QueueStore.isRunning(this)) {
+        if (AccountStore.isDiscovering(this)) {
+            handler.postDelayed(() -> scheduleAccountFlow(0), 700);
+        } else if (QueueStore.isRunning(this)) {
             showOverlay();
             handler.postDelayed(this::ensureCurrentItemOpen, 600);
         }
@@ -70,6 +89,12 @@ public class InviteAccessibilityService extends AccessibilityService {
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null || event.getPackageName() == null) return;
         boolean amazonEvent = MainActivity.AMAZON_PACKAGE.contentEquals(event.getPackageName());
+
+        if (AccountStore.isDiscovering(this)) {
+            hideOverlay();
+            if (amazonEvent) scheduleAccountFlow(260);
+            return;
+        }
 
         if (!QueueStore.isRunning(this)) {
             hideOverlay();
@@ -85,7 +110,11 @@ public class InviteAccessibilityService extends AccessibilityService {
         if (QueueStore.isPaused(this)) return;
         if (!amazonEvent) return;
 
-        scheduleProcess(450);
+        if (!AccountStore.selected(this).isEmpty() && !AccountStore.isRunAccountReady(this)) {
+            scheduleAccountFlow(300);
+        } else {
+            scheduleProcess(450);
+        }
     }
 
     @Override public void onInterrupt() {}
@@ -350,6 +379,344 @@ public class InviteAccessibilityService extends AccessibilityService {
         return t.length() <= 45 ? t : t.substring(0, 42).trim() + "…";
     }
 
+    private void scheduleAccountFlow(long delay) {
+        if (accountFlowScheduled) return;
+        accountFlowScheduled = true;
+        handler.postDelayed(() -> {
+            accountFlowScheduled = false;
+            processAccountFlow();
+        }, delay);
+    }
+
+    private void processAccountFlow() {
+        boolean discovering = AccountStore.isDiscovering(this);
+        if (!discovering && (!QueueStore.isRunning(this) || QueueStore.isPaused(this))) return;
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) {
+            scheduleAccountFlow(500);
+            return;
+        }
+
+        Set<String> visibleEmails = collectEmails(root);
+        boolean onSwitchList = treeContains(root, "switch accounts") && !visibleEmails.isEmpty();
+
+        if (discovering) {
+            if (onSwitchList) {
+                int before = AccountStore.load(this).size();
+                AccountStore.mergeDiscovered(this, visibleEmails);
+                int after = AccountStore.load(this).size();
+                discoveryNoNewPasses = after > before ? 0 : discoveryNoNewPasses + 1;
+                notifyChanged();
+
+                if (discoveryScrolls < 24 && discoveryNoNewPasses < 2) {
+                    discoveryScrolls++;
+                    boolean scrolled = scrollForward(root);
+                    if (!scrolled) performSwipeUp();
+                    root.recycle();
+                    handler.postDelayed(() -> scheduleAccountFlow(0), 650);
+                    return;
+                }
+
+                root.recycle();
+                AccountStore.finishDiscovery(this);
+                discoveryScrolls = 0;
+                discoveryNoNewPasses = 0;
+                accountNavAttempts = 0;
+                notifyChanged();
+                Toast.makeText(this, "Amazon accounts refreshed", Toast.LENGTH_SHORT).show();
+                handler.postDelayed(this::returnToHelper, 300);
+                return;
+            }
+
+            boolean moved = navigateTowardSwitchAccounts(root);
+            root.recycle();
+            accountNavAttempts++;
+            if (!moved && accountNavAttempts % 6 == 0) launchAmazonHome();
+            if (accountNavAttempts > 35) {
+                AccountStore.finishDiscovery(this);
+                accountNavAttempts = 0;
+                notifyChanged();
+                Toast.makeText(this, "Couldn't reach Amazon's Switch Accounts screen. Open the You page and try refresh again.", Toast.LENGTH_LONG).show();
+                returnToHelper();
+                return;
+            }
+            handler.postDelayed(() -> scheduleAccountFlow(0), moved ? 650 : 450);
+            return;
+        }
+
+        ArrayList<AmazonAccount> selected = AccountStore.selected(this);
+        if (selected.isEmpty()) {
+            AccountStore.setRunAccountReady(this, true);
+            root.recycle();
+            ensureCurrentItemOpen();
+            return;
+        }
+
+        int accountIndex = AccountStore.getRunAccountIndex(this);
+        if (accountIndex < 0 || accountIndex >= selected.size()) {
+            root.recycle();
+            finishRun("Queue complete");
+            return;
+        }
+        String target = AccountStore.canonicalEmail(selected.get(accountIndex).email);
+
+        if (accountSwitchClickedAt > 0L) {
+            long sinceClick = System.currentTimeMillis() - accountSwitchClickedAt;
+            // Wait until Amazon has actually left the Switch Accounts list. This avoids
+            // opening the product while the old account is still active.
+            if (!onSwitchList && sinceClick >= 900L) {
+                markRunAccountReady(target);
+                root.recycle();
+                handler.postDelayed(this::ensureCurrentItemOpen, 700);
+                return;
+            }
+            if (onSwitchList && sinceClick > 6000L) {
+                // The row may not have accepted the first click. Re-find it by email;
+                // never fall through to a positional row click.
+                accountSwitchClickedAt = 0L;
+                accountSwitchTarget = "";
+                accountSwitchScrolls = 0;
+            }
+            root.recycle();
+            handler.postDelayed(() -> scheduleAccountFlow(0), 350);
+            return;
+        }
+
+        if (onSwitchList) {
+            AccessibilityNodeInfo row = findAccountRowByEmail(root, target);
+            if (row != null) {
+                if (isSelectedNodeOrParent(row)) {
+                    try { row.recycle(); } catch (Exception ignored) {}
+                    root.recycle();
+                    markRunAccountReady(target);
+                    handler.postDelayed(this::ensureCurrentItemOpen, 500);
+                    return;
+                }
+                boolean clicked = clickNode(row) || tapNode(row);
+                try { row.recycle(); } catch (Exception ignored) {}
+                root.recycle();
+                if (clicked) {
+                    accountSwitchClickedAt = System.currentTimeMillis();
+                    accountSwitchTarget = target;
+                    updateOverlay("Switching account… " + shortEmail(target));
+                    handler.postDelayed(() -> scheduleAccountFlow(0), 750);
+                } else {
+                    handler.postDelayed(() -> scheduleAccountFlow(0), 450);
+                }
+                return;
+            }
+
+            if (accountSwitchScrolls++ < 24) {
+                boolean scrolled = scrollForward(root);
+                if (!scrolled) performSwipeUp();
+                root.recycle();
+                handler.postDelayed(() -> scheduleAccountFlow(0), 650);
+                return;
+            }
+
+            root.recycle();
+            failCurrentAccount("Account email not found in Switch Accounts");
+            return;
+        }
+
+        boolean moved = navigateTowardSwitchAccounts(root);
+        root.recycle();
+        accountNavAttempts++;
+        if (!moved && accountNavAttempts % 6 == 0) launchAmazonHome();
+        if (accountNavAttempts > 35) {
+            failCurrentAccount("Couldn't open Switch Accounts");
+            return;
+        }
+        handler.postDelayed(() -> scheduleAccountFlow(0), moved ? 650 : 450);
+    }
+
+    private boolean navigateTowardSwitchAccounts(AccessibilityNodeInfo root) {
+        AccessibilityNodeInfo switchButton = findNodeByText(root, "switch accounts", true);
+        if (switchButton != null) {
+            boolean clicked = clickNode(switchButton);
+            if (!clicked && isLowerHalf(switchButton)) clicked = tapNode(switchButton);
+            try { switchButton.recycle(); } catch (Exception ignored) {}
+            if (clicked) return true;
+        }
+
+        AccessibilityNodeInfo hello = findHelloNode(root);
+        if (hello != null) {
+            boolean clicked = clickNode(hello) || tapNode(hello);
+            try { hello.recycle(); } catch (Exception ignored) {}
+            if (clicked) return true;
+        }
+
+        AccessibilityNodeInfo you = findNodeByText(root, "you", true);
+        if (you != null) {
+            boolean clicked = clickNode(you) || tapNode(you);
+            try { you.recycle(); } catch (Exception ignored) {}
+            if (clicked) return true;
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findHelloNode(AccessibilityNodeInfo root) {
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(root));
+        AccessibilityNodeInfo best = null;
+        int bestArea = Integer.MAX_VALUE;
+        while (!q.isEmpty()) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            String lower = combinedText(n).toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
+            if (isVisibleOnScreen(n) && lower.startsWith("hello,")) {
+                Rect r = new Rect();
+                n.getBoundsInScreen(r);
+                int area = Math.max(1, r.width()) * Math.max(1, r.height());
+                if (area < bestArea) {
+                    if (best != null) best.recycle();
+                    best = AccessibilityNodeInfo.obtain(n);
+                    bestArea = area;
+                }
+            }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
+        }
+        return best;
+    }
+
+    private Set<String> collectEmails(AccessibilityNodeInfo root) {
+        Set<String> out = new HashSet<>();
+        String raw = subtreeText(root, 260);
+        Matcher m = EMAIL_PATTERN.matcher(raw);
+        while (m.find()) {
+            String email = AccountStore.canonicalEmail(m.group(1) + "@" + m.group(2));
+            if (!email.isEmpty()) out.add(email);
+        }
+        return out;
+    }
+
+    private AccessibilityNodeInfo findAccountRowByEmail(AccessibilityNodeInfo root, String email) {
+        String wanted = AccountStore.canonicalEmail(email);
+        if (wanted.isEmpty()) return null;
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(root));
+        AccessibilityNodeInfo best = null;
+        long bestArea = Long.MAX_VALUE;
+        while (!q.isEmpty()) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            if (isVisibleOnScreen(n)) {
+                String block = AccountStore.canonicalEmail(subtreeText(n, 16));
+                if (block.contains(wanted)) {
+                    Rect r = new Rect();
+                    n.getBoundsInScreen(r);
+                    long area = (long) Math.max(1, r.width()) * Math.max(1, r.height());
+                    if (area < bestArea) {
+                        if (best != null) best.recycle();
+                        best = AccessibilityNodeInfo.obtain(n);
+                        bestArea = area;
+                    }
+                }
+            }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
+        }
+        return best;
+    }
+
+    private void markRunAccountReady(String target) {
+        AccountStore.setRunAccountEmail(this, target);
+        AccountStore.setRunAccountReady(this, true);
+        workingIndex = -1;
+        accountSwitchClickedAt = 0L;
+        accountSwitchTarget = "";
+        accountSwitchScrolls = 0;
+        accountNavAttempts = 0;
+        notifyChanged();
+    }
+
+    private boolean isSelectedNodeOrParent(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        AccessibilityNodeInfo current = AccessibilityNodeInfo.obtain(node);
+        for (int i = 0; i < 5 && current != null; i++) {
+            if (current.isSelected() || current.isChecked()) {
+                current.recycle();
+                return true;
+            }
+            AccessibilityNodeInfo parent = current.getParent();
+            current.recycle();
+            current = parent;
+        }
+        if (current != null) current.recycle();
+        return false;
+    }
+
+    private boolean isLowerHalf(AccessibilityNodeInfo node) {
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+        return !r.isEmpty() && r.centerY() > getResources().getDisplayMetrics().heightPixels * 0.45f;
+    }
+
+    private String shortEmail(String email) {
+        String e = email == null ? "" : email.trim();
+        if (e.length() <= 28) return e;
+        int at = e.indexOf('@');
+        if (at > 0) {
+            String local = e.substring(0, Math.min(at, 14));
+            return local + "…" + e.substring(at);
+        }
+        return e.substring(0, 25) + "…";
+    }
+
+    private void failCurrentAccount(String reason) {
+        ArrayList<AmazonAccount> selected = AccountStore.selected(this);
+        int accountIndex = AccountStore.getRunAccountIndex(this);
+        if (accountIndex < 0 || accountIndex >= selected.size()) {
+            finishRun(reason);
+            return;
+        }
+        String email = AccountStore.canonicalEmail(selected.get(accountIndex).email);
+        ArrayList<ProductItem> items = QueueStore.load(this);
+        long now = System.currentTimeMillis();
+        for (ProductItem item : items) item.setAccountResult(email, ProductItem.Status.ERROR, now, reason);
+        QueueStore.save(this, items);
+        notifyChanged();
+
+        int nextAccount = accountIndex + 1;
+        if (nextAccount >= selected.size()) {
+            finishRun("Queue complete — one or more accounts could not be switched");
+            return;
+        }
+        AccountStore.setRunAccountIndex(this, nextAccount);
+        AccountStore.setRunAccountReady(this, false);
+        AccountStore.setRunAccountEmail(this, "");
+        QueueStore.setCurrentIndex(this, 0);
+        workingIndex = -1;
+        accountSwitchScrolls = 0;
+        accountNavAttempts = 0;
+        accountSwitchClickedAt = 0L;
+        launchAmazonHome();
+        handler.postDelayed(() -> scheduleAccountFlow(0), 750);
+    }
+
+    private void launchAmazonHome() {
+        try {
+            Intent launch = getPackageManager().getLaunchIntentForPackage(MainActivity.AMAZON_PACKAGE);
+            if (launch != null) {
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(launch);
+                return;
+            }
+        } catch (Exception ignored) {}
+        try {
+            Intent fallback = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.amazon.co.uk/"));
+            fallback.setPackage(MainActivity.AMAZON_PACKAGE);
+            fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            startActivity(fallback);
+        } catch (Exception ignored) {}
+    }
+
     private void scheduleProcess(long delay) {
         if (processingScheduled) return;
         processingScheduled = true;
@@ -361,6 +728,10 @@ public class InviteAccessibilityService extends AccessibilityService {
 
     private void ensureCurrentItemOpen() {
         if (!QueueStore.isRunning(this) || QueueStore.isPaused(this)) return;
+        if (!AccountStore.selected(this).isEmpty() && !AccountStore.isRunAccountReady(this)) {
+            scheduleAccountFlow(0);
+            return;
+        }
         ArrayList<ProductItem> items = QueueStore.load(this);
         if (items.isEmpty()) {
             finishRun("Queue is empty");
@@ -393,6 +764,10 @@ public class InviteAccessibilityService extends AccessibilityService {
 
     private void processCurrentScreen() {
         if (!QueueStore.isRunning(this) || QueueStore.isPaused(this)) return;
+        if (!AccountStore.selected(this).isEmpty() && !AccountStore.isRunAccountReady(this)) {
+            scheduleAccountFlow(0);
+            return;
+        }
         if (advanceScheduled) return;
         long now = System.currentTimeMillis();
         if (now < settleUntil) {
@@ -439,7 +814,8 @@ public class InviteAccessibilityService extends AccessibilityService {
         // already-purchased/requested page from being misread because Amazon keeps
         // other hidden or stale accessibility text around during navigation.
         if (scan.purchased) {
-            markAndAdvance(ProductItem.Status.PURCHASED, "Already purchased");
+            String purchaseNote = scan.purchaseLimit ? "Amazon says this account has already purchased the one-per-customer item" : "Previously purchased on this account";
+            markAndAdvance(ProductItem.Status.PURCHASED, "Purchased before", purchaseNote);
             recycleScan(scan);
             root.recycle();
             return;
@@ -448,7 +824,11 @@ public class InviteAccessibilityService extends AccessibilityService {
         // A requested page contains the sentence "If invited to purchase...".
         // Always give the explicit requested state priority over any availability wording.
         if (scan.requested) {
-            markAndAdvance(ProductItem.Status.REQUESTED, "Invitation already requested");
+            if (clickedRequest && requestClickedAt > 0L) {
+                markAndAdvance(ProductItem.Status.REQUESTED_NOW, "Invitation requested now");
+            } else {
+                markAndAdvance(ProductItem.Status.ALREADY_REQUESTED, "Invitation already requested");
+            }
             recycleScan(scan);
             root.recycle();
             return;
@@ -562,6 +942,12 @@ public class InviteAccessibilityService extends AccessibilityService {
                         "you last purchased this item",
                         "you bought this item")) {
                     result.purchased = true;
+                }
+                if (containsAny(text,
+                        "limit purchases to one per customer",
+                        "limited to one per customer",
+                        "purchase limit of one per customer")) {
+                    result.purchaseLimit = true;
                 }
 
                 // Only strong, account-specific wording counts as AVAILABLE.
@@ -680,6 +1066,7 @@ public class InviteAccessibilityService extends AccessibilityService {
                 "invitation requested", "save this item", "add to list",
                 "product safety", "secure transaction", "returnable within",
                 "shipper / seller", "qualifying items", "customers say", "see all details",
+                "thanks for shopping with us", "limit purchases to one per customer",
                 "share this product with friends", "terms", "prime")) return false;
         if (s.contains("£") || s.matches("^[0-9.,%+\\- ]+$")) return false;
         return true;
@@ -814,9 +1201,17 @@ public class InviteAccessibilityService extends AccessibilityService {
 
     private void mark(ArrayList<ProductItem> items, int index, ProductItem.Status status, String note) {
         ProductItem item = items.get(index);
+        long now = System.currentTimeMillis();
         item.status = status;
-        item.lastChecked = System.currentTimeMillis();
+        item.lastChecked = now;
         item.note = note == null ? "" : note.trim();
+        String accountEmail = AccountStore.getRunAccountEmail(this);
+        if (accountEmail == null || accountEmail.trim().isEmpty()) {
+            accountEmail = AccountStore.currentSelectedEmail(this);
+        }
+        if (accountEmail != null && !accountEmail.trim().isEmpty()) {
+            item.setAccountResult(accountEmail, status, now, item.note);
+        }
         QueueStore.save(this, items);
     }
 
@@ -839,6 +1234,23 @@ public class InviteAccessibilityService extends AccessibilityService {
             ArrayList<ProductItem> items = QueueStore.load(this);
             int next = expectedIndex + 1;
             if (next >= items.size()) {
+                ArrayList<AmazonAccount> selectedAccounts = AccountStore.selected(this);
+                int currentAccount = AccountStore.getRunAccountIndex(this);
+                if (!selectedAccounts.isEmpty() && currentAccount + 1 < selectedAccounts.size()) {
+                    advanceScheduled = false;
+                    AccountStore.setRunAccountIndex(this, currentAccount + 1);
+                    AccountStore.setRunAccountReady(this, false);
+                    AccountStore.setRunAccountEmail(this, "");
+                    QueueStore.setCurrentIndex(this, 0);
+                    workingIndex = -1;
+                    accountSwitchScrolls = 0;
+                    accountNavAttempts = 0;
+                    accountSwitchClickedAt = 0L;
+                    notifyChanged();
+                    launchAmazonHome();
+                    handler.postDelayed(() -> scheduleAccountFlow(0), 850);
+                    return;
+                }
                 advanceScheduled = false;
                 finishRun("Queue complete");
                 return;
@@ -856,6 +1268,7 @@ public class InviteAccessibilityService extends AccessibilityService {
     private void finishRun(String message) {
         QueueStore.setRunning(this, false);
         QueueStore.setPaused(this, false);
+        AccountStore.setRunAccountReady(this, false);
         advanceScheduled = false;
         updateOverlay(message);
         notifyChanged();
@@ -962,7 +1375,14 @@ public class InviteAccessibilityService extends AccessibilityService {
         ArrayList<ProductItem> items = QueueStore.load(this);
         int i = QueueStore.getCurrentIndex(this);
         String state = QueueStore.isPaused(this) ? "PAUSED" : "Scanning";
-        overlayText.setText("Invite Helper • " + state + " • " + (items.isEmpty() ? "0/0" : (Math.min(i + 1, items.size()) + "/" + items.size())));
+        ArrayList<AmazonAccount> accounts = AccountStore.selected(this);
+        if (!accounts.isEmpty()) {
+            int ai = AccountStore.getRunAccountIndex(this);
+            String email = ai >= 0 && ai < accounts.size() ? shortEmail(accounts.get(ai).email) : "account";
+            overlayText.setText("Invite Helper • " + state + " • A" + Math.min(ai + 1, accounts.size()) + "/" + accounts.size() + " " + email + " • " + (items.isEmpty() ? "0/0" : (Math.min(i + 1, items.size()) + "/" + items.size())));
+        } else {
+            overlayText.setText("Invite Helper • " + state + " • " + (items.isEmpty() ? "0/0" : (Math.min(i + 1, items.size()) + "/" + items.size())));
+        }
     }
 
     private void updateOverlay(String message) {
@@ -985,6 +1405,7 @@ public class InviteAccessibilityService extends AccessibilityService {
         boolean available = false;
         boolean requested = false;
         boolean purchased = false;
+        boolean purchaseLimit = false;
         boolean normalPurchase = false;
         boolean thirdParty = false;
         String sellerName = "";

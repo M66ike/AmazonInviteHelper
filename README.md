@@ -1,15 +1,20 @@
-# Amazon Invite Helper v1.4
+# Amazon Invite Helper v1.5
 
 Android accessibility helper for maintaining and checking a queue of Amazon invitation products.
 
-## v1.4 changes
-- **Quick Add from search results:** long-press an Amazon product to open its preview; the helper automatically follows **Share → More → Add to Invite Helper**.
-- Captures the product title before sharing, saves the Amazon shared link, de-duplicates by title/link, then closes the share panel and returns to the results.
-- Merely scrolling past search results does not add anything.
-- Queue scanning recognises normal **Add to basket / Buy Now** pages sold by a third-party seller and records **Other seller / normal sale** instead of hanging on the item.
-- Seller name is recorded when Amazon exposes it to Accessibility.
-- Existing invitation states remain: Requested, Available to Buy, Already Purchased, No invitation control, and errors.
+## v1.5 changes
+- **Multi-account checking:** discover Amazon accounts from **You → Switch Accounts** and save them by email address.
+- Account rows are always re-found by their **email text**. The helper never assumes the next account is the next row, so Amazon can reorder the account list after each switch.
+- The account finder and switcher scroll the Switch Accounts list when required.
+- Discovered accounts appear as tick boxes in the helper so you can choose which accounts are included in a run.
+- A run checks the complete product queue for one selected account, then switches to the next selected account and repeats. This minimises account changes while still storing a separate result for every product/account combination.
+- **REQUESTED NOW** means the helper pressed Request invite during this run and then saw Amazon's confirmation.
+- **ALREADY REQUESTED** means the confirmation was already present before the helper pressed anything.
+- **PURCHASED BEFORE** recognises Amazon's existing purchased wording plus the **“Thanks for shopping with us … limit purchases to one per customer”** screen.
+- **Copy list (names + links)** exports `Product name | URL` when a name is known, or just the URL otherwise. The same mixed format can be pasted directly back into the Add products box.
+- Keeps v1.4 Quick Add: long-press an Amazon result → Share → More → Add to Invite Helper.
+- Keeps normal sale / other-seller detection and does not press any purchase controls.
 - **Stop when available** remains OFF by default.
-- Uses the supplied ninja/Amazon artwork as the Android launcher icon.
 
-The helper never presses Add to Basket, Buy Now, checkout, or payment controls.
+## Safety boundary
+The helper can request invitations. It never presses **Add to Basket**, **Buy Now**, checkout, payment, or order-confirmation controls.

@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">Amazon Invite Helper</string>
-    <string name="accessibility_service_description">Scans Amazon product pages in your queue, requests invitations when the Request invite control is present, and flags products that are available for you to buy. It never presses purchase controls.</string>
+    <string name="accessibility_service_description">Checks queued Amazon product pages across selected Amazon accounts, requests invitations when the Request invite control is present, and records requested, purchased and available states. It never presses purchase controls.</string>
 </resources>
