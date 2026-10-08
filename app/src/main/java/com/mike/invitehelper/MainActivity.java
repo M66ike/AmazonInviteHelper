@@ -36,10 +36,8 @@ public class MainActivity extends Activity {
     public static final String INVITE_SEARCH_URL = "https://www.amazon.co.uk/s?k=Pokemon+Trading+Card+Game&rh=p_123%3A325733%2Cp_6%3AA3P5ROKL5A1OLE&s=date-desc-rank&dc=";
 
     private LinearLayout listContainer;
-    private LinearLayout accountContainer;
     private TextView serviceState;
     private TextView runState;
-    private TextView accountState;
     private EditText input;
     private CheckBox quickAdd;
     private CheckBox autoRequest;
@@ -54,7 +52,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        QueueStore.applyV15Defaults(this);
+        QueueStore.applyV14Defaults(this);
         setContentView(buildUi());
         refresh();
     }
@@ -91,7 +89,7 @@ public class MainActivity extends Activity {
 
         TextView title = text("Amazon Invite Helper", 25, true);
         root.addView(title);
-        TextView sub = text("Queues Amazon product pages across the Amazon accounts you select, requests invitation-only items, and flags products that become available for you to buy. It never presses Add to Basket or Buy Now.", 15, false);
+        TextView sub = text("Queues Amazon product pages, requests invitation-only items, and flags products that become available for you to buy. It never presses Add to Basket or Buy Now.", 15, false);
         sub.setPadding(0, dp(6), 0, dp(12));
         root.addView(sub);
 
@@ -106,30 +104,11 @@ public class MainActivity extends Activity {
         search.setOnClickListener(v -> openAmazon(INVITE_SEARCH_URL));
         root.addView(search);
 
-        TextView accountHeader = text("Amazon accounts", 19, true);
-        accountHeader.setPadding(0, dp(16), 0, dp(5));
-        root.addView(accountHeader);
-
-        TextView accountHint = text("Use Find / refresh accounts once. The helper opens Amazon's Switch Accounts screen, reads each account by email address, scrolls the list if needed, and remembers the accounts here. Account positions can move — switching is always matched by email, never by row number.", 13, false);
-        root.addView(accountHint);
-
-        Button discover = button("Find / refresh Amazon accounts");
-        discover.setOnClickListener(v -> startAccountDiscovery());
-        root.addView(discover);
-
-        accountState = text("", 13, true);
-        accountState.setPadding(0, dp(5), 0, dp(3));
-        root.addView(accountState);
-
-        accountContainer = new LinearLayout(this);
-        accountContainer.setOrientation(LinearLayout.VERTICAL);
-        root.addView(accountContainer, lpMatch());
-
         TextView addHeader = text("Add products", 19, true);
         addHeader.setPadding(0, dp(16), 0, dp(5));
         root.addView(addHeader);
 
-        TextView hint = text("Paste one Amazon URL or ASIN per line, or use Amazon’s Share button → Amazon Invite Helper while browsing. Exported lists can be pasted straight back here using: Product name | URL", 13, false);
+        TextView hint = text("Paste one Amazon URL or ASIN per line, or use Amazon’s Share button → Amazon Invite Helper while browsing. You can also use: Product name | URL", 13, false);
         root.addView(hint);
 
         input = new EditText(this);
@@ -221,26 +200,10 @@ public class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        TextView footer = text("V1.5 adds multi-account checking by email, separate REQUESTED NOW / ALREADY REQUESTED results, copy-and-paste name + link lists, and the Amazon 'Thanks for shopping with us / one per customer' purchased-before screen.", 12, false);
+        TextView footer = text("V1.4.1 uses the proven v1.4 single-account flow. Status scanning now moves down the Amazon page in smaller steps and checks each position twice so invitation/purchase text is less likely to be skipped. REQUESTED NOW and ALREADY REQUESTED are shown separately, and Copy List includes product names where available.", 12, false);
         footer.setPadding(0, dp(16), 0, 0);
         root.addView(footer);
         return scroller;
-    }
-
-    private void startAccountDiscovery() {
-        if (!isServiceEnabled()) {
-            Toast.makeText(this, "Enable Amazon Invite Helper in Accessibility first.", Toast.LENGTH_LONG).show();
-            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-            return;
-        }
-        if (QueueStore.isRunning(this)) {
-            Toast.makeText(this, "Stop the current queue before refreshing accounts.", Toast.LENGTH_LONG).show();
-            return;
-        }
-        AccountStore.startDiscovery(this);
-        launchAmazonHome();
-        Toast.makeText(this, "Opening Amazon to read Switch Accounts…", Toast.LENGTH_LONG).show();
-        broadcastChanged();
     }
 
     private void startQueue() {
@@ -254,38 +217,25 @@ public class MainActivity extends Activity {
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
             return;
         }
-
-        ArrayList<AmazonAccount> accounts = AccountStore.load(this);
-        if (!accounts.isEmpty() && AccountStore.selected(this).isEmpty()) {
-            Toast.makeText(this, "Select at least one Amazon account, or refresh the account list.", Toast.LENGTH_LONG).show();
-            return;
-        }
-
         boolean wasRunning = QueueStore.isRunning(this);
-        if (!wasRunning) {
-            QueueStore.setCurrentIndex(this, 0);
-            AccountStore.resetRun(this);
-        }
+        int index = wasRunning ? QueueStore.getCurrentIndex(this) : 0;
+        if (index < 0 || index >= items.size()) index = 0;
+        QueueStore.setCurrentIndex(this, index);
         QueueStore.setPaused(this, false);
         QueueStore.setRunning(this, true);
-
-        if (!AccountStore.selected(this).isEmpty() && !AccountStore.isRunAccountReady(this)) {
-            launchAmazonHome();
-        } else {
-            int index = QueueStore.getCurrentIndex(this);
-            if (index < 0 || index >= items.size()) index = 0;
-            QueueStore.setCurrentIndex(this, index);
-            openAmazon(items.get(index).url);
-        }
+        openAmazon(items.get(index).url);
         broadcastChanged();
     }
 
     private void resetStatuses() {
         ArrayList<ProductItem> items = QueueStore.load(this);
-        for (ProductItem item : items) item.clearResults();
+        for (ProductItem item : items) {
+            item.status = ProductItem.Status.PENDING;
+            item.lastChecked = 0L;
+            item.note = "";
+        }
         QueueStore.save(this, items);
         QueueStore.setCurrentIndex(this, 0);
-        AccountStore.resetRun(this);
         refresh();
     }
 
@@ -295,27 +245,15 @@ public class MainActivity extends Activity {
         serviceState.setText(enabled ? "Accessibility: enabled" : "Accessibility: NOT enabled");
         serviceState.setTextColor(enabled ? Color.rgb(0, 120, 70) : Color.rgb(180, 40, 40));
 
-        refreshAccounts();
-
         boolean running = QueueStore.isRunning(this);
         boolean paused = QueueStore.isPaused(this);
         int index = QueueStore.getCurrentIndex(this);
         ArrayList<ProductItem> items = QueueStore.load(this);
-        ArrayList<AmazonAccount> selectedAccounts = AccountStore.selected(this);
-        int accountIndex = AccountStore.getRunAccountIndex(this);
-        if (running) {
-            if (!selectedAccounts.isEmpty()) {
-                runState.setText("Run: " + (paused ? "PAUSED" : "RUNNING") + "   Account " + Math.min(accountIndex + 1, selectedAccounts.size()) + " / " + selectedAccounts.size() + "   Item " + Math.min(index + 1, items.size()) + " / " + items.size());
-            } else {
-                runState.setText("Run: " + (paused ? "PAUSED" : "RUNNING") + "   Item " + Math.min(index + 1, items.size()) + " / " + items.size());
-            }
-        } else {
-            runState.setText("Run: stopped   " + items.size() + " queued");
-        }
+        if (running) runState.setText("Run: " + (paused ? "PAUSED" : "RUNNING") + "   Item " + Math.min(index + 1, items.size()) + " / " + items.size());
+        else runState.setText("Run: stopped   " + items.size() + " queued");
 
         listContainer.removeAllViews();
         DateFormat df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT);
-        ArrayList<AmazonAccount> knownAccounts = AccountStore.load(this);
         for (int i = 0; i < items.size(); i++) {
             final int position = i;
             ProductItem item = items.get(i);
@@ -328,24 +266,11 @@ public class MainActivity extends Activity {
             TextView nameView = text((i + 1) + ". " + name, 14, true);
             card.addView(nameView);
 
-            if (!knownAccounts.isEmpty()) {
-                boolean addedAny = false;
-                for (AmazonAccount account : knownAccounts) {
-                    if (!account.selected && item.getAccountResult(account.email) == null) continue;
-                    ProductItem.AccountResult result = item.getAccountResult(account.email);
-                    ProductItem.Status s = result == null ? ProductItem.Status.PENDING : result.status;
-                    long checkedAt = result == null ? 0L : result.lastChecked;
-                    String checked = checkedAt == 0 ? "Not checked" : df.format(new Date(checkedAt));
-                    String note = result == null || result.note == null || result.note.trim().isEmpty() ? "" : " — " + result.note.trim();
-                    TextView state = text(account.email + " — " + statusText(s) + note + " • " + checked, 12, false);
-                    state.setTextColor(statusColor(s));
-                    card.addView(state);
-                    addedAny = true;
-                }
-                if (!addedAny) addLegacyState(card, item, df);
-            } else {
-                addLegacyState(card, item, df);
-            }
+            String checked = item.lastChecked == 0 ? "Never checked" : df.format(new Date(item.lastChecked));
+            String note = item.note == null || item.note.trim().isEmpty() ? "" : " — " + item.note.trim();
+            TextView state = text(statusText(item.status) + note + " • " + checked, 12, false);
+            state.setTextColor(statusColor(item.status));
+            card.addView(state);
 
             LinearLayout actions = horizontal();
             Button open = smallButton("Open");
@@ -369,42 +294,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void refreshAccounts() {
-        if (accountContainer == null || accountState == null) return;
-        accountContainer.removeAllViews();
-        ArrayList<AmazonAccount> accounts = AccountStore.load(this);
-        if (AccountStore.isDiscovering(this)) {
-            accountState.setText("Reading Amazon accounts… keep Amazon open for a few seconds.");
-            accountState.setTextColor(Color.rgb(130, 90, 0));
-        } else if (accounts.isEmpty()) {
-            accountState.setText("No accounts saved yet. The queue can still check the currently signed-in Amazon account only.");
-            accountState.setTextColor(Color.DKGRAY);
-        } else {
-            int selected = 0;
-            for (AmazonAccount a : accounts) if (a.selected) selected++;
-            accountState.setText(accounts.size() + " account" + (accounts.size() == 1 ? "" : "s") + " found • " + selected + " selected");
-            accountState.setTextColor(Color.rgb(0, 95, 145));
-        }
-
-        for (AmazonAccount account : accounts) {
-            CheckBox cb = new CheckBox(this);
-            cb.setText(account.email);
-            cb.setChecked(account.selected);
-            cb.setOnCheckedChangeListener((buttonView, checked) -> AccountStore.setSelected(this, account.email, checked));
-            accountContainer.addView(cb, lpMatch());
-        }
-    }
-
-    private void addLegacyState(LinearLayout card, ProductItem item, DateFormat df) {
-        String checked = item.lastChecked == 0 ? "Never checked" : df.format(new Date(item.lastChecked));
-        String note = item.note == null || item.note.trim().isEmpty() ? "" : " — " + item.note.trim();
-        TextView state = text(statusText(item.status) + note + " • " + checked, 12, false);
-        state.setTextColor(statusColor(item.status));
-        card.addView(state);
-    }
-
     private String statusText(ProductItem.Status status) {
-        if (status == null) return "Pending";
         switch (status) {
             case REQUESTED_NOW: return "REQUESTED NOW";
             case ALREADY_REQUESTED: return "ALREADY REQUESTED";
@@ -419,7 +309,6 @@ public class MainActivity extends Activity {
     }
 
     private int statusColor(ProductItem.Status status) {
-        if (status == null) return Color.rgb(130, 90, 0);
         switch (status) {
             case AVAILABLE: return Color.rgb(0, 125, 70);
             case REQUESTED_NOW: return Color.rgb(0, 115, 85);
@@ -445,18 +334,6 @@ public class MainActivity extends Activity {
             }
         }
         return false;
-    }
-
-    private void launchAmazonHome() {
-        try {
-            Intent launch = getPackageManager().getLaunchIntentForPackage(AMAZON_PACKAGE);
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                startActivity(launch);
-                return;
-            }
-        } catch (Exception ignored) {}
-        openAmazon("https://www.amazon.co.uk/");
     }
 
     private void openAmazon(String url) {

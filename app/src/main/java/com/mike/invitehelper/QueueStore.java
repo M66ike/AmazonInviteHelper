@@ -166,14 +166,14 @@ public final class QueueStore {
     }
 
 
-    public static void applyV15Defaults(Context c) {
+    public static void applyV14Defaults(Context c) {
         SharedPreferences p = prefs(c);
-        if (p.getInt("defaults_version", 0) < 15) {
+        if (p.getInt("defaults_version", 0) < 14) {
             p.edit()
                     .putBoolean("stop_on_available", false)
                     .putBoolean("quick_add", true)
                     .putBoolean("auto_collect_opened", false)
-                    .putInt("defaults_version", 15)
+                    .putInt("defaults_version", 14)
                     .apply();
         }
     }
@@ -186,7 +186,7 @@ public final class QueueStore {
         return prefs(c).getBoolean("quick_add", true);
     }
 
-    // Kept for compatibility with settings from v1.3. v1.5 no longer auto-shares
+    // Kept for compatibility with settings from v1.3. v1.4 no longer auto-shares
     // full product pages; Quick Add is intentionally triggered by a long-press preview.
     public static void setAutoCollectOpened(Context c, boolean value) {
         prefs(c).edit().putBoolean("auto_collect_opened", value).apply();
