@@ -200,7 +200,7 @@ public class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        TextView footer = text("V1.4.1 uses the proven v1.4 single-account flow. Status scanning now moves down the Amazon page in smaller steps and checks each position twice so invitation/purchase text is less likely to be skipped. REQUESTED NOW and ALREADY REQUESTED are shown separately, and Copy List includes product names where available.", 12, false);
+        TextView footer = text("V1.4.2 keeps the proven v1.4 single-account flow. High-confidence Amazon statuses are now read from the whole accessibility tree, with a direct Android text-search fallback, so visible invitation/purchase messages are not rejected because WebView bounds are wrong. Clickable controls still have to be genuinely visible.", 12, false);
         footer.setPadding(0, dp(16), 0, 0);
         root.addView(footer);
         return scroller;

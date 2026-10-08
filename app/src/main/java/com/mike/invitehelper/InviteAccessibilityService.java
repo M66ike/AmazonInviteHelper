@@ -25,6 +25,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Locale;
+import java.util.List;
 
 public class InviteAccessibilityService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -428,6 +429,11 @@ public class InviteAccessibilityService extends AccessibilityService {
 
         ScanResult scan = scanTree(root);
 
+        if (scan.diagnosticText != null && !scan.diagnosticText.isEmpty()) {
+            updateOverlay("Scanning " + Math.min(scrollAttempts + 1, MAX_SCROLLS) + "/" + MAX_SCROLLS +
+                    " • text: " + scan.diagnosticText);
+        }
+
         if (scan.productTitle != null && !scan.productTitle.isEmpty()) {
             ProductItem current = items.get(index);
             if (isPlaceholderLabel(current.label)) {
@@ -571,15 +577,25 @@ public class InviteAccessibilityService extends AccessibilityService {
 
         int screenHeight = getResources().getDisplayMetrics().heightPixels;
         int bestTitleScore = Integer.MIN_VALUE;
+        StringBuilder pageText = new StringBuilder(4096);
 
         while (!q.isEmpty()) {
             AccessibilityNodeInfo n = q.removeFirst();
-            String text = combinedText(n).toLowerCase(Locale.ROOT);
+            String rawCombined = combinedText(n);
+            String text = normalizeScanText(rawCombined);
+
+            if (!text.isEmpty()) {
+                // Keep a text-only copy of the whole currently exposed Amazon tree.
+                // WebView accessibility bounds are not always trustworthy while scrolling,
+                // but its text is often still present and usable.
+                pageText.append(text).append(' ');
+                applyStrongStatusText(result, text);
+            }
 
             boolean visible = isVisibleOnScreen(n);
-            boolean nearScreen = visible || isNearScreen(n);
 
-            // Clickable/seller controls still need to be genuinely visible.
+            // Controls that we may click, plus seller controls, MUST still be genuinely
+            // visible. Only passive high-confidence status text ignores node bounds.
             if (visible) {
                 if (containsAny(text, "add to basket", "buy now")) {
                     result.normalPurchase = true;
@@ -593,55 +609,8 @@ public class InviteAccessibilityService extends AccessibilityService {
                 }
             }
 
-            // Strong status phrases are allowed just outside the viewport too. Amazon's
-            // accessibility bounds can lag behind the visual scroll, which previously
-            // meant the app could scroll past a status without ever accepting it.
-            if (nearScreen) {
-                if (containsAny(text,
-                        "thanks for shopping with us",
-                        "you purchased this item",
-                        "you last purchased this item",
-                        "you bought this item",
-                        "previously purchased")) {
-                    result.purchased = true;
-                }
-                if (containsAny(text,
-                        "limit purchases to one per customer",
-                        "purchases to one per customer")) {
-                    result.purchaseLimit = true;
-                    result.purchased = true;
-                }
-
-                // Only strong, account-specific wording counts as AVAILABLE.
-                // Do not match generic "invited to purchase" because the requested state
-                // itself can contain that wording.
-                if (containsAny(text,
-                        "available for you to buy",
-                        "available for you to purchase",
-                        "you have been invited to purchase",
-                        "your invitation is ready",
-                        "your invitation to purchase",
-                        "congratulations, you're invited",
-                        "congratulations, you’re invited")) {
-                    result.available = true;
-                }
-                if (containsAny(text,
-                        "invitation requested",
-                        "invitation requested, thanks",
-                        "request submitted",
-                        "you have requested an invitation",
-                        "you've requested an invitation",
-                        "you’ve requested an invitation",
-                        "you'll get an email with a link that's valid for 72 hours",
-                        "you’ll get an email with a link that’s valid for 72 hours",
-                        "we'll email you if you're invited",
-                        "we’ll email you if you’re invited")) {
-                    result.requested = true;
-                }
-            }
-
             if (visible && scrollAttempts <= 2 && n.getText() != null) {
-                String raw = n.getText().toString().replace('\n', ' ').replaceAll("\\s+", " " ).trim();
+                String raw = n.getText().toString().replace('\n', ' ').replaceAll("\\s+", " ").trim();
                 if (looksLikeProductTitle(raw)) {
                     Rect bounds = new Rect();
                     n.getBoundsInScreen(bounds);
@@ -659,11 +628,147 @@ public class InviteAccessibilityService extends AccessibilityService {
             }
             n.recycle();
         }
+
+        // Second pass: join all accessibility text together. This catches Amazon WebView
+        // states where a sentence is split across several nodes (for example
+        // "Invitation requested," and "thanks!").
+        String wholeTreeText = normalizeScanText(pageText.toString());
+        applyStrongStatusText(result, wholeTreeText);
+
+        // Third pass: Android's direct text search can find virtual WebView text that is
+        // visible to accessibility but awkwardly positioned or absent from our normal
+        // traversal at the exact moment of a scroll. These searches intentionally use
+        // only high-confidence terminal phrases.
+        if (!result.requested && directTreeContains(root,
+                "Invitation requested",
+                "Request submitted")) {
+            result.requested = true;
+            result.diagnosticText = "Invitation requested";
+        }
+        if (!result.purchased && directTreeContains(root,
+                "Thanks for shopping with us",
+                "limit purchases to one per customer")) {
+            result.purchased = true;
+            result.diagnosticText = "Purchased before";
+        }
+        if (!result.available && directTreeContains(root,
+                "available for you to buy",
+                "available for you to purchase",
+                "your invitation is ready")) {
+            result.available = true;
+            result.diagnosticText = "Available to buy";
+        }
+
+        // Preserve the more specific purchase-limit note when it appears anywhere in the
+        // complete current tree, even if the individual node had odd bounds.
+        if (containsAny(wholeTreeText,
+                "limit purchases to one per customer",
+                "purchases to one per customer")) {
+            result.purchaseLimit = true;
+            result.purchased = true;
+            result.diagnosticText = "Purchase limit found";
+        }
+
+        if (result.diagnosticText.isEmpty()) {
+            result.diagnosticText = diagnosticHint(wholeTreeText);
+        }
+
         if (result.normalPurchase && result.sellerName != null && !result.sellerName.isEmpty() &&
                 !result.sellerName.equalsIgnoreCase("Amazon") && !result.sellerName.equalsIgnoreCase("Amazon.co.uk")) {
             result.thirdParty = true;
         }
         return result;
+    }
+
+    private void applyStrongStatusText(ScanResult result, String text) {
+        if (result == null || text == null || text.isEmpty()) return;
+
+        if (containsAny(text,
+                "thanks for shopping with us",
+                "you purchased this item",
+                "you last purchased this item",
+                "you bought this item",
+                "previously purchased")) {
+            result.purchased = true;
+            result.diagnosticText = "Purchased before";
+        }
+        if (containsAny(text,
+                "limit purchases to one per customer",
+                "purchases to one per customer")) {
+            result.purchaseLimit = true;
+            result.purchased = true;
+            result.diagnosticText = "Purchase limit found";
+        }
+
+        // Only strong, account-specific wording counts as AVAILABLE. Do not use the
+        // generic "invited to purchase" wording because the requested confirmation itself
+        // contains that sentence.
+        if (containsAny(text,
+                "available for you to buy",
+                "available for you to purchase",
+                "you have been invited to purchase",
+                "your invitation is ready",
+                "your invitation to purchase",
+                "congratulations, you're invited")) {
+            result.available = true;
+            if (!result.purchased) result.diagnosticText = "Available to buy";
+        }
+
+        if (containsAny(text,
+                "invitation requested",
+                "request submitted",
+                "you have requested an invitation",
+                "you've requested an invitation",
+                "you'll get an email with a link that's valid for 72 hours",
+                "we'll email you if you're invited")) {
+            result.requested = true;
+            if (!result.purchased) result.diagnosticText = "Invitation requested";
+        }
+    }
+
+    private String normalizeScanText(String text) {
+        if (text == null) return "";
+        return text
+                .replace('’', '\'')
+                .replace('‘', '\'')
+                .replace('`', '\'')
+                .replace('\n', ' ')
+                .replace('\r', ' ')
+                .replaceAll("\\s+", " ")
+                .trim()
+                .toLowerCase(Locale.ROOT);
+    }
+
+    private boolean directTreeContains(AccessibilityNodeInfo root, String... phrases) {
+        if (root == null || phrases == null) return false;
+        for (String phrase : phrases) {
+            if (phrase == null || phrase.trim().isEmpty()) continue;
+            List<AccessibilityNodeInfo> matches = null;
+            try {
+                matches = root.findAccessibilityNodeInfosByText(phrase);
+                if (matches != null && !matches.isEmpty()) return true;
+            } catch (Exception ignored) {
+            } finally {
+                if (matches != null) {
+                    for (AccessibilityNodeInfo match : matches) {
+                        if (match != null) {
+                            try { match.recycle(); } catch (Exception ignored) {}
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private String diagnosticHint(String wholeTreeText) {
+        if (wholeTreeText == null || wholeTreeText.isEmpty()) return "";
+        if (wholeTreeText.contains("invitation requested")) return "Invitation requested";
+        if (wholeTreeText.contains("request invite")) return "Request invite";
+        if (wholeTreeText.contains("thanks for shopping")) return "Thanks for shopping";
+        if (wholeTreeText.contains("shipper / seller") || wholeTreeText.contains("shipper/seller")) return "Seller section";
+        if (wholeTreeText.contains("add to basket") || wholeTreeText.contains("buy now")) return "Normal purchase controls";
+        return "";
     }
 
     private String extractSellerFromNode(AccessibilityNodeInfo node) {
@@ -1067,6 +1172,7 @@ public class InviteAccessibilityService extends AccessibilityService {
         boolean thirdParty = false;
         String sellerName = "";
         String productTitle = "";
+        String diagnosticText = "";
         AccessibilityNodeInfo requestNode = null;
     }
 }
