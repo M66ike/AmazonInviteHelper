@@ -1,25 +1,15 @@
-# Building the APK
+# Build
 
-This project intentionally uses only Android platform APIs, with no third-party runtime dependencies.
+The project is configured for GitHub Actions and Android Gradle builds.
 
-Recommended toolchain as of September 2026:
-
-- Android Gradle Plugin 9.1.1
-- Gradle 9.3.1 or newer
-- JDK 17+
-- Android SDK platform 37
-- Android Build Tools 36.0.0+
-
-In Android Studio, open the project and choose **Build > Build APK(s)**.
-
-From a configured command line:
+Debug APK command:
 
 ```bash
-./gradlew assembleDebug
+gradle assembleDebug
 ```
 
-The APK will be at:
+Output:
 
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
+`app/build/outputs/apk/debug/app-debug.apk`
+
+App version: 1.1 (versionCode 2)

@@ -138,6 +138,23 @@ public class InviteAccessibilityService extends AccessibilityService {
 
         ScanResult scan = scanTree(root);
 
+        if (scan.productTitle != null && !scan.productTitle.isEmpty()) {
+            ProductItem current = items.get(index);
+            if (current.label == null || current.label.trim().isEmpty()) {
+                current.label = scan.productTitle;
+                QueueStore.save(this, items);
+                notifyChanged();
+            }
+        }
+
+        // A requested page contains the sentence "If invited to purchase...".
+        // Always give the explicit requested state priority over any availability wording.
+        if (scan.requested) {
+            markAndAdvance(ProductItem.Status.REQUESTED, "Invitation already requested");
+            root.recycle();
+            return;
+        }
+
         if (scan.available) {
             mark(items, index, ProductItem.Status.AVAILABLE);
             notifyChanged();
@@ -148,12 +165,6 @@ public class InviteAccessibilityService extends AccessibilityService {
             } else {
                 advanceAfter(1200);
             }
-            root.recycle();
-            return;
-        }
-
-        if (scan.requested) {
-            markAndAdvance(ProductItem.Status.REQUESTED, "Invitation already requested");
             root.recycle();
             return;
         }
@@ -206,26 +217,47 @@ public class InviteAccessibilityService extends AccessibilityService {
         Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
         q.add(AccessibilityNodeInfo.obtain(root));
 
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int bestTitleScore = Integer.MIN_VALUE;
+
         while (!q.isEmpty()) {
             AccessibilityNodeInfo n = q.removeFirst();
             String text = combinedText(n).toLowerCase(Locale.ROOT);
 
+            // Only strong, account-specific wording counts as AVAILABLE.
+            // Do not match generic "invited to purchase" because the requested state
+            // itself says "If invited to purchase...".
             if (containsAny(text,
                     "available for you to buy",
-                    "available to buy",
                     "available for you to purchase",
                     "you have been invited to purchase",
-                    "invited to purchase")) {
+                    "your invitation is ready",
+                    "congratulations, you're invited",
+                    "congratulations, you’re invited")) {
                 result.available = true;
             }
             if (containsAny(text,
                     "invitation requested",
                     "invitation requested, thanks",
-                    "you'll get an email with a link that's valid for 72 hours")) {
+                    "you'll get an email with a link that's valid for 72 hours",
+                    "you’ll get an email with a link that’s valid for 72 hours")) {
                 result.requested = true;
             }
             if (result.requestNode == null && containsAny(text, "request invite", "request invitation")) {
                 result.requestNode = AccessibilityNodeInfo.obtain(n);
+            }
+
+            if (scrollAttempts <= 2 && n.getText() != null) {
+                String raw = n.getText().toString().replace('\n', ' ').replaceAll("\\s+", " " ).trim();
+                if (looksLikeProductTitle(raw)) {
+                    Rect bounds = new Rect();
+                    n.getBoundsInScreen(bounds);
+                    int score = titleScore(raw, bounds, screenHeight);
+                    if (score > bestTitleScore) {
+                        bestTitleScore = score;
+                        result.productTitle = raw.length() > 180 ? raw.substring(0, 180).trim() : raw;
+                    }
+                }
             }
 
             for (int i = 0; i < n.getChildCount(); i++) {
@@ -235,6 +267,33 @@ public class InviteAccessibilityService extends AccessibilityService {
             n.recycle();
         }
         return result;
+    }
+
+    private boolean looksLikeProductTitle(String raw) {
+        if (raw == null) return false;
+        String s = raw.trim();
+        if (s.length() < 14 || s.length() > 240) return false;
+        String l = s.toLowerCase(Locale.ROOT);
+        if (containsAny(l,
+                "search or ask", "visit the store", "sponsored", "bought in past",
+                "free returns", "available by invitation", "request invite",
+                "invitation requested", "save this item", "add to list",
+                "product safety", "secure transaction", "returnable within",
+                "shipper / seller", "qualifying items", "terms", "prime")) return false;
+        if (s.contains("£") || s.matches("^[0-9.,%+\\- ]+$")) return false;
+        return true;
+    }
+
+    private int titleScore(String raw, Rect bounds, int screenHeight) {
+        int score = 0;
+        int top = Math.max(0, bounds.top);
+        float y = screenHeight <= 0 ? 0.5f : (float) top / (float) screenHeight;
+        if (y >= 0.14f && y <= 0.48f) score += 8;
+        else if (y >= 0.08f && y <= 0.60f) score += 3;
+        if (raw.length() >= 24 && raw.length() <= 170) score += 4;
+        if (raw.toLowerCase(Locale.ROOT).contains("pokémon") || raw.toLowerCase(Locale.ROOT).contains("pokemon")) score += 2;
+        if (raw.contains(":") || raw.contains("—") || raw.contains("-")) score += 1;
+        return score;
     }
 
     private String combinedText(AccessibilityNodeInfo n) {
@@ -456,6 +515,7 @@ public class InviteAccessibilityService extends AccessibilityService {
     private static final class ScanResult {
         boolean available = false;
         boolean requested = false;
+        String productTitle = "";
         AccessibilityNodeInfo requestNode = null;
     }
 }

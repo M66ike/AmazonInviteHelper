@@ -52,14 +52,12 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(buildUi());
-        handleIncomingText(getIntent());
         refresh();
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        handleIncomingText(intent);
     }
 
     @Override
@@ -108,7 +106,7 @@ public class MainActivity extends Activity {
         addHeader.setPadding(0, dp(16), 0, dp(5));
         root.addView(addHeader);
 
-        TextView hint = text("Paste one Amazon URL or ASIN per line. You can also use: Product name | URL", 13, false);
+        TextView hint = text("Paste one Amazon URL or ASIN per line, or use Amazon’s Share button → Amazon Invite Helper while browsing. You can also use: Product name | URL", 13, false);
         root.addView(hint);
 
         input = new EditText(this);
@@ -186,7 +184,7 @@ public class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        TextView footer = text("V1 works entirely through Android’s Accessibility API on the Amazon Shopping app. Amazon can change its screen text/layout, so the scanner intentionally uses several text checks and a scrolling fallback.", 12, false);
+        TextView footer = text("V1.1 works through Android’s Accessibility API on the Amazon Shopping app. Use Amazon’s Share button to add products while browsing. Product names are saved from the share data or captured from the product page when first opened.", 12, false);
         footer.setPadding(0, dp(16), 0, 0);
         root.addView(footer);
         return scroller;
@@ -246,7 +244,7 @@ public class MainActivity extends Activity {
             card.setPadding(dp(10), dp(8), dp(10), dp(8));
             card.setBackgroundColor(i == index && running ? Color.rgb(255, 247, 210) : Color.rgb(245, 245, 245));
 
-            String name = item.label.isEmpty() ? item.url : item.label;
+            String name = item.label.isEmpty() ? "Amazon item — name will be captured when opened" : item.label;
             TextView nameView = text((i + 1) + ". " + name, 14, true);
             card.addView(nameView);
 
@@ -329,17 +327,6 @@ public class MainActivity extends Activity {
         if (clip != null && clip.getItemCount() > 0) {
             CharSequence s = clip.getItemAt(0).coerceToText(this);
             input.setText(s);
-        }
-    }
-
-    private void handleIncomingText(Intent intent) {
-        if (intent == null) return;
-        if (Intent.ACTION_SEND.equals(intent.getAction()) && "text/plain".equals(intent.getType())) {
-            String shared = intent.getStringExtra(Intent.EXTRA_TEXT);
-            if (shared != null) {
-                QueueStore.addLines(this, shared);
-                Toast.makeText(this, "Added shared Amazon link to queue.", Toast.LENGTH_SHORT).show();
-            }
         }
     }
 

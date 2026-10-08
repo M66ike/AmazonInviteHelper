@@ -52,27 +52,59 @@ public final class QueueStore {
             String value = line;
             int pipe = line.indexOf('|');
             if (pipe > 0 && pipe < line.length() - 1) {
-                label = line.substring(0, pipe).trim();
+                label = cleanLabel(line.substring(0, pipe));
                 value = line.substring(pipe + 1).trim();
+            } else {
+                label = labelFromSharedText(line);
             }
 
             String url = normalizeToAmazonUrl(value);
             if (url == null) continue;
-
-            boolean duplicate = false;
-            for (ProductItem existing : items) {
-                if (existing.url.equalsIgnoreCase(url)) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) items.add(new ProductItem(label, url));
+            addOrUpdate(items, label, url);
         }
         save(c, items);
     }
 
+    public static synchronized boolean addShared(Context c, String sharedText, String sharedSubject) {
+        if (sharedText == null) return false;
+        String url = normalizeToAmazonUrl(sharedText);
+        if (url == null) return false;
+
+        String label = cleanLabel(sharedSubject);
+        if (label.isEmpty()) label = labelFromSharedText(sharedText);
+
+        ArrayList<ProductItem> items = load(c);
+        addOrUpdate(items, label, url);
+        save(c, items);
+        return true;
+    }
+
+    private static void addOrUpdate(ArrayList<ProductItem> items, String label, String url) {
+        for (ProductItem existing : items) {
+            if (existing.url.equalsIgnoreCase(url)) {
+                if (existing.label.isEmpty() && label != null && !label.trim().isEmpty()) {
+                    existing.label = cleanLabel(label);
+                }
+                return;
+            }
+        }
+        items.add(new ProductItem(cleanLabel(label), url));
+    }
+
+    public static synchronized void updateLabel(Context c, int index, String label) {
+        String clean = cleanLabel(label);
+        if (clean.isEmpty()) return;
+        ArrayList<ProductItem> items = load(c);
+        if (index < 0 || index >= items.size()) return;
+        ProductItem item = items.get(index);
+        if (item.label == null || item.label.trim().isEmpty() || item.label.startsWith("Amazon item")) {
+            item.label = clean;
+            save(c, items);
+        }
+    }
+
     public static String normalizeToAmazonUrl(String value) {
-        String v = value.trim();
+        String v = value == null ? "" : value.trim();
 
         Matcher urlMatcher = URL_PATTERN.matcher(v);
         if (urlMatcher.find()) {
@@ -87,6 +119,33 @@ public final class QueueStore {
             return "https://www.amazon.co.uk/dp/" + v.toUpperCase(Locale.ROOT);
         }
         return null;
+    }
+
+    private static String labelFromSharedText(String raw) {
+        if (raw == null) return "";
+        String text = raw.replace('\r', ' ').replace('\n', ' ').trim();
+        Matcher m = URL_PATTERN.matcher(text);
+        if (m.find()) {
+            String before = text.substring(0, m.start()).trim();
+            String after = text.substring(m.end()).trim();
+            String candidate = before.length() >= 8 ? before : after;
+            candidate = candidate
+                    .replaceAll("(?i)^check out this product on amazon[:\\s-]*", "")
+                    .replaceAll("(?i)^check this out on amazon[:\\s-]*", "")
+                    .replaceAll("(?i)^amazon\\s*[-–—:]?\\s*", "")
+                    .trim();
+            return cleanLabel(candidate);
+        }
+        return "";
+    }
+
+    private static String cleanLabel(String value) {
+        if (value == null) return "";
+        String s = value.replace('\r', ' ').replace('\n', ' ').replaceAll("\\s+", " ").trim();
+        if (s.length() > 180) s = s.substring(0, 180).trim();
+        if (s.equalsIgnoreCase("Amazon") || s.equalsIgnoreCase("Amazon.co.uk")) return "";
+        if (s.startsWith("http://") || s.startsWith("https://")) return "";
+        return s;
     }
 
     public static void setCurrentIndex(Context c, int index) {
