@@ -72,6 +72,8 @@ public final class QueueStore {
 
         String label = cleanLabel(sharedSubject);
         if (label.isEmpty()) label = labelFromSharedText(sharedText);
+        if (label.isEmpty()) label = consumePendingCaptureTitle(c);
+        else clearPendingCaptureTitle(c);
 
         ArrayList<ProductItem> items = load(c);
         addOrUpdate(items, label, url);
@@ -80,15 +82,28 @@ public final class QueueStore {
     }
 
     private static void addOrUpdate(ArrayList<ProductItem> items, String label, String url) {
+        String clean = cleanLabel(label);
         for (ProductItem existing : items) {
-            if (existing.url.equalsIgnoreCase(url)) {
-                if (existing.label.isEmpty() && label != null && !label.trim().isEmpty()) {
-                    existing.label = cleanLabel(label);
+            boolean sameUrl = existing.url.equalsIgnoreCase(url);
+            boolean sameNamedProduct = !clean.isEmpty() && existing.label != null &&
+                    !existing.label.trim().isEmpty() && existing.label.trim().equalsIgnoreCase(clean);
+            if (sameUrl || sameNamedProduct) {
+                if ((existing.label == null || existing.label.trim().isEmpty()) && !clean.isEmpty()) {
+                    existing.label = clean;
                 }
                 return;
             }
         }
-        items.add(new ProductItem(cleanLabel(label), url));
+        items.add(new ProductItem(clean, url));
+    }
+
+    public static synchronized boolean containsLabel(Context c, String label) {
+        String clean = cleanLabel(label);
+        if (clean.isEmpty()) return false;
+        for (ProductItem item : load(c)) {
+            if (item.label != null && item.label.trim().equalsIgnoreCase(clean)) return true;
+        }
+        return false;
     }
 
     public static synchronized void updateLabel(Context c, int index, String label) {
@@ -151,14 +166,38 @@ public final class QueueStore {
     }
 
 
-    public static void applyV12Defaults(Context c) {
+    public static void applyV13Defaults(Context c) {
         SharedPreferences p = prefs(c);
-        if (p.getInt("defaults_version", 0) < 12) {
+        if (p.getInt("defaults_version", 0) < 13) {
             p.edit()
                     .putBoolean("stop_on_available", false)
-                    .putInt("defaults_version", 12)
+                    .putBoolean("auto_collect_opened", true)
+                    .putInt("defaults_version", 13)
                     .apply();
         }
+    }
+
+    public static void setAutoCollectOpened(Context c, boolean value) {
+        prefs(c).edit().putBoolean("auto_collect_opened", value).apply();
+    }
+
+    public static boolean autoCollectOpened(Context c) {
+        return prefs(c).getBoolean("auto_collect_opened", true);
+    }
+
+    public static void setPendingCaptureTitle(Context c, String title) {
+        prefs(c).edit().putString("pending_capture_title", cleanLabel(title)).apply();
+    }
+
+    public static String consumePendingCaptureTitle(Context c) {
+        SharedPreferences p = prefs(c);
+        String title = p.getString("pending_capture_title", "");
+        p.edit().remove("pending_capture_title").apply();
+        return cleanLabel(title);
+    }
+
+    public static void clearPendingCaptureTitle(Context c) {
+        prefs(c).edit().remove("pending_capture_title").apply();
     }
 
     public static void setCurrentIndex(Context c, int index) {

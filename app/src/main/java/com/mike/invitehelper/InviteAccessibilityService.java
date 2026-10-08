@@ -24,7 +24,9 @@ import android.widget.Toast;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 public class InviteAccessibilityService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -42,6 +44,14 @@ public class InviteAccessibilityService extends AccessibilityService {
     private boolean advanceScheduled = false;
     private long settleUntil = 0L;
     private int itemGeneration = 0;
+
+    // Passive collection mode (v1.3): only products the user actually opens are captured.
+    private boolean captureScheduled = false;
+    private boolean captureShareInProgress = false;
+    private String pendingCaptureTitle = "";
+    private long captureStartedAt = 0L;
+    private final Set<String> capturedTitlesThisSession = new HashSet<>();
+
     private static final int MAX_SCROLLS = 18;
 
     @Override
@@ -56,16 +66,22 @@ public class InviteAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null || event.getPackageName() == null) return;
+        boolean amazonEvent = MainActivity.AMAZON_PACKAGE.contentEquals(event.getPackageName());
+
         if (!QueueStore.isRunning(this)) {
             hideOverlay();
+            if (amazonEvent && QueueStore.autoCollectOpened(this) && !captureShareInProgress) {
+                schedulePassiveCapture(700);
+            }
             return;
         }
+
         showOverlay();
         updateOverlay();
 
         if (QueueStore.isPaused(this)) return;
-        if (event == null || event.getPackageName() == null) return;
-        if (!MainActivity.AMAZON_PACKAGE.contentEquals(event.getPackageName())) return;
+        if (!amazonEvent) return;
 
         scheduleProcess(450);
     }
@@ -76,6 +92,187 @@ public class InviteAccessibilityService extends AccessibilityService {
     public void onDestroy() {
         hideOverlay();
         super.onDestroy();
+    }
+
+    private void schedulePassiveCapture(long delay) {
+        if (captureScheduled || captureShareInProgress || QueueStore.isRunning(this)) return;
+        captureScheduled = true;
+        handler.postDelayed(() -> {
+            captureScheduled = false;
+            processPassiveCapture();
+        }, delay);
+    }
+
+    private void processPassiveCapture() {
+        if (QueueStore.isRunning(this) || !QueueStore.autoCollectOpened(this) || captureShareInProgress) return;
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+        CaptureResult capture = scanForOpenedProduct(root);
+        root.recycle();
+
+        if (capture.shareNode == null || capture.productTitle == null || capture.productTitle.trim().isEmpty() || !capture.looksLikeProductPage) {
+            recycleCapture(capture);
+            return;
+        }
+
+        String key = capture.productTitle.trim().toLowerCase(Locale.ROOT);
+        if (capturedTitlesThisSession.contains(key) || QueueStore.containsLabel(this, capture.productTitle)) {
+            capturedTitlesThisSession.add(key);
+            recycleCapture(capture);
+            return;
+        }
+
+        pendingCaptureTitle = capture.productTitle.trim();
+        QueueStore.setPendingCaptureTitle(this, pendingCaptureTitle);
+        captureShareInProgress = true;
+        captureStartedAt = System.currentTimeMillis();
+        capturedTitlesThisSession.add(key);
+
+        boolean clicked = clickNode(capture.shareNode);
+        if (!clicked) clicked = tapNode(capture.shareNode);
+        recycleCapture(capture);
+
+        if (!clicked) {
+            captureShareInProgress = false;
+            QueueStore.clearPendingCaptureTitle(this);
+            capturedTitlesThisSession.remove(key);
+            pendingCaptureTitle = "";
+            return;
+        }
+
+        // Amazon's own share action provides the canonical/shared product link. Once
+        // the Android share sheet appears, select our receiver automatically.
+        handler.postDelayed(() -> pollShareSheetForHelper(0), 450);
+    }
+
+    private CaptureResult scanForOpenedProduct(AccessibilityNodeInfo root) {
+        CaptureResult result = new CaptureResult();
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(root));
+
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int bestTitleScore = Integer.MIN_VALUE;
+        int markerCount = 0;
+
+        while (!q.isEmpty()) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            boolean visible = isVisibleOnScreen(n);
+            String rawCombined = combinedText(n).replace('\n', ' ').replaceAll("\\s+", " ").trim();
+            String lower = rawCombined.toLowerCase(Locale.ROOT);
+
+            if (visible) {
+                if (containsAny(lower,
+                        "visit the store", "bought in past month", "free returns",
+                        "available by invitation", "request invite", "invitation requested",
+                        "save this item", "add to list", "product safety",
+                        "shipper / seller", "thanks for shopping with us")) {
+                    markerCount++;
+                }
+
+                if (result.shareNode == null && isAmazonShareControl(n, lower)) {
+                    result.shareNode = AccessibilityNodeInfo.obtain(n);
+                }
+
+                if (n.getText() != null) {
+                    String raw = n.getText().toString().replace('\n', ' ').replaceAll("\\s+", " ").trim();
+                    if (looksLikeProductTitle(raw)) {
+                        Rect bounds = new Rect();
+                        n.getBoundsInScreen(bounds);
+                        int score = titleScore(raw, bounds, screenHeight);
+                        if (score > bestTitleScore) {
+                            bestTitleScore = score;
+                            result.productTitle = raw.length() > 180 ? raw.substring(0, 180).trim() : raw;
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
+        }
+
+        // Search/result pages may contain product names but normally do not expose the
+        // product-page Share control alongside product-detail markers. Requiring both is
+        // what makes scrolling past products safe.
+        result.looksLikeProductPage = result.shareNode != null && markerCount >= 1;
+        return result;
+    }
+
+    private boolean isAmazonShareControl(AccessibilityNodeInfo node, String lowerCombined) {
+        if (node == null || lowerCombined == null) return false;
+        String t = lowerCombined.trim();
+        if (!(t.equals("share") || t.equals("share item") || t.startsWith("share "))) return false;
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+        if (r.isEmpty()) return false;
+        int w = getResources().getDisplayMetrics().widthPixels;
+        int h = getResources().getDisplayMetrics().heightPixels;
+        // Amazon's product-page share icon sits in the upper/right portion of the page.
+        return r.centerX() > (w * 0.55f) && r.centerY() < (h * 0.62f);
+    }
+
+    private void pollShareSheetForHelper(int attempt) {
+        if (!captureShareInProgress) return;
+        if (System.currentTimeMillis() - captureStartedAt > 7000L || attempt >= 12) {
+            performGlobalAction(GLOBAL_ACTION_BACK);
+            QueueStore.clearPendingCaptureTitle(this);
+            captureShareInProgress = false;
+            pendingCaptureTitle = "";
+            Toast.makeText(this, "Couldn't auto-capture that Amazon link. Try Share → Add to Invite Helper once.", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        AccessibilityNodeInfo target = root == null ? null : findShareTarget(root);
+        if (root != null) root.recycle();
+
+        if (target != null) {
+            boolean clicked = clickNode(target);
+            if (!clicked) clicked = tapNode(target);
+            try { target.recycle(); } catch (Exception ignored) {}
+            if (clicked) {
+                handler.postDelayed(() -> {
+                    captureShareInProgress = false;
+                    pendingCaptureTitle = "";
+                    // ShareReceiverActivity is Theme.NoDisplay and immediately finishes,
+                    // so Android returns the user to the same Amazon product page.
+                }, 1400);
+                return;
+            }
+        }
+        handler.postDelayed(() -> pollShareSheetForHelper(attempt + 1), 450);
+    }
+
+    private AccessibilityNodeInfo findShareTarget(AccessibilityNodeInfo root) {
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(root));
+        while (!q.isEmpty()) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            String lower = combinedText(n).toLowerCase(Locale.ROOT).trim();
+            if (containsAny(lower, "add to invite helper", "amazon invite helper")) {
+                AccessibilityNodeInfo out = AccessibilityNodeInfo.obtain(n);
+                n.recycle();
+                while (!q.isEmpty()) q.removeFirst().recycle();
+                return out;
+            }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
+        }
+        return null;
+    }
+
+    private void recycleCapture(CaptureResult capture) {
+        if (capture != null && capture.shareNode != null) {
+            try { capture.shareNode.recycle(); } catch (Exception ignored) {}
+            capture.shareNode = null;
+        }
     }
 
     private void scheduleProcess(long delay) {
@@ -604,6 +801,12 @@ public class InviteAccessibilityService extends AccessibilityService {
 
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private static final class CaptureResult {
+        boolean looksLikeProductPage = false;
+        String productTitle = "";
+        AccessibilityNodeInfo shareNode = null;
     }
 
     private static final class ScanResult {

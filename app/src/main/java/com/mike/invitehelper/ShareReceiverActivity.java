@@ -37,6 +37,7 @@ public class ShareReceiverActivity extends Activity {
             changed.setPackage(getPackageName());
             sendBroadcast(changed);
         } else {
+            QueueStore.clearPendingCaptureTitle(this);
             Toast.makeText(this, "No Amazon link found in shared item", Toast.LENGTH_SHORT).show();
         }
     }

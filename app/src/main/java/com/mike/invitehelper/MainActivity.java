@@ -39,6 +39,7 @@ public class MainActivity extends Activity {
     private TextView serviceState;
     private TextView runState;
     private EditText input;
+    private CheckBox autoCollectOpened;
     private CheckBox autoRequest;
     private CheckBox stopOnAvailable;
 
@@ -51,7 +52,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        QueueStore.applyV12Defaults(this);
+        QueueStore.applyV13Defaults(this);
         setContentView(buildUi());
         refresh();
     }
@@ -130,6 +131,16 @@ public class MainActivity extends Activity {
         addRow.addView(add, lpWeight());
         root.addView(addRow);
 
+        autoCollectOpened = new CheckBox(this);
+        autoCollectOpened.setText("Automatically add product pages I open in Amazon");
+        autoCollectOpened.setChecked(QueueStore.autoCollectOpened(this));
+        autoCollectOpened.setOnCheckedChangeListener((b, checked) -> QueueStore.setAutoCollectOpened(this, checked));
+        root.addView(autoCollectOpened);
+
+        TextView collectHint = text("Only products you actually open are collected — scrolling past search results will not add them. Amazon's share panel may flash briefly while the helper captures the link.", 12, false);
+        collectHint.setPadding(dp(8), 0, dp(8), dp(5));
+        root.addView(collectHint);
+
         autoRequest = new CheckBox(this);
         autoRequest.setText("Automatically tap “Request invite”");
         autoRequest.setChecked(QueueStore.autoRequest(this));
@@ -177,6 +188,10 @@ public class MainActivity extends Activity {
         reset.setOnClickListener(v -> resetStatuses());
         root.addView(reset);
 
+        Button copyLinks = button("Copy all product links");
+        copyLinks.setOnClickListener(v -> copyAllLinks());
+        root.addView(copyLinks);
+
         Button clear = button("Clear queue");
         clear.setOnClickListener(v -> {
             QueueStore.save(this, new ArrayList<>());
@@ -185,7 +200,7 @@ public class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        TextView footer = text("V1.2 works through Android’s Accessibility API on the Amazon Shopping app. It now distinguishes already-purchased items, returns to Invite Helper after a completed run, and avoids duplicate advances that could skip queue items.", 12, false);
+        TextView footer = text("V1.3 can automatically collect products when you open their Amazon product page. It captures the shared Amazon link and product name, de-duplicates the queue, and does not collect products that you only scroll past.", 12, false);
         footer.setPadding(0, dp(16), 0, 0);
         root.addView(footer);
         return scroller;
@@ -321,6 +336,25 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
             catch (Exception ignored) { Toast.makeText(this, "Couldn't open that URL.", Toast.LENGTH_SHORT).show(); }
+        }
+    }
+
+    private void copyAllLinks() {
+        ArrayList<ProductItem> items = QueueStore.load(this);
+        if (items.isEmpty()) {
+            Toast.makeText(this, "Queue is empty.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        StringBuilder b = new StringBuilder();
+        for (ProductItem item : items) {
+            if (item.url == null || item.url.trim().isEmpty()) continue;
+            if (b.length() > 0) b.append('\n');
+            b.append(item.url.trim());
+        }
+        ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (cm != null) {
+            cm.setPrimaryClip(ClipData.newPlainText("Amazon Invite Helper links", b.toString()));
+            Toast.makeText(this, "Copied " + items.size() + " product links", Toast.LENGTH_SHORT).show();
         }
     }
 
