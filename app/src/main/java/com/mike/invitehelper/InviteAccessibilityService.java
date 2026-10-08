@@ -24,9 +24,7 @@ import android.widget.Toast;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
-import java.util.HashSet;
 import java.util.Locale;
-import java.util.Set;
 
 public class InviteAccessibilityService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -45,12 +43,16 @@ public class InviteAccessibilityService extends AccessibilityService {
     private long settleUntil = 0L;
     private int itemGeneration = 0;
 
-    // Passive collection mode (v1.3): only products the user actually opens are captured.
-    private boolean captureScheduled = false;
-    private boolean captureShareInProgress = false;
-    private String pendingCaptureTitle = "";
-    private long captureStartedAt = 0L;
-    private final Set<String> capturedTitlesThisSession = new HashSet<>();
+    // Quick Add mode (v1.4): deliberately triggered by an Amazon long-press preview.
+    private static final int QA_IDLE = 0;
+    private static final int QA_WAIT_AMAZON_SHARE_PANEL = 1;
+    private static final int QA_WAIT_SYSTEM_SHARE = 2;
+    private static final int QA_WAIT_RETURN = 3;
+    private int quickAddStage = QA_IDLE;
+    private boolean quickAddScheduled = false;
+    private long quickAddStartedAt = 0L;
+    private long quickAddCooldownUntil = 0L;
+    private String quickAddTitle = "";
 
     private static final int MAX_SCROLLS = 18;
 
@@ -71,8 +73,8 @@ public class InviteAccessibilityService extends AccessibilityService {
 
         if (!QueueStore.isRunning(this)) {
             hideOverlay();
-            if (amazonEvent && QueueStore.autoCollectOpened(this) && !captureShareInProgress) {
-                schedulePassiveCapture(700);
+            if (QueueStore.quickAdd(this) && (amazonEvent || quickAddStage != QA_IDLE)) {
+                scheduleQuickAdd(260);
             }
             return;
         }
@@ -94,92 +96,125 @@ public class InviteAccessibilityService extends AccessibilityService {
         super.onDestroy();
     }
 
-    private void schedulePassiveCapture(long delay) {
-        if (captureScheduled || captureShareInProgress || QueueStore.isRunning(this)) return;
-        captureScheduled = true;
+    private void scheduleQuickAdd(long delay) {
+        if (quickAddScheduled || QueueStore.isRunning(this) || !QueueStore.quickAdd(this)) return;
+        quickAddScheduled = true;
         handler.postDelayed(() -> {
-            captureScheduled = false;
-            processPassiveCapture();
+            quickAddScheduled = false;
+            processQuickAdd();
         }, delay);
     }
 
-    private void processPassiveCapture() {
-        if (QueueStore.isRunning(this) || !QueueStore.autoCollectOpened(this) || captureShareInProgress) return;
+    private void processQuickAdd() {
+        if (QueueStore.isRunning(this) || !QueueStore.quickAdd(this)) return;
+        long now = System.currentTimeMillis();
+        if (now < quickAddCooldownUntil) return;
+        if (quickAddStage != QA_IDLE && now - quickAddStartedAt > 11000L) {
+            resetQuickAdd("Quick Add timed out — try the long-press again.", false);
+            return;
+        }
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return;
-        CaptureResult capture = scanForOpenedProduct(root);
+
+        if (quickAddStage == QA_IDLE) {
+            QuickAddPreview preview = scanQuickAddPreview(root);
+            root.recycle();
+            if (!preview.isPreview || preview.productTitle.isEmpty()) {
+                recycleQuickAddPreview(preview);
+                return;
+            }
+
+            quickAddTitle = preview.productTitle.trim();
+            if (QueueStore.containsLabel(this, quickAddTitle)) {
+                recycleQuickAddPreview(preview);
+                quickAddCooldownUntil = now + 1400L;
+                Toast.makeText(this, "Already in queue: " + shortTitle(quickAddTitle), Toast.LENGTH_SHORT).show();
+                // Close the long-press preview so the user can immediately pick another item.
+                handler.postDelayed(() -> performGlobalAction(GLOBAL_ACTION_BACK), 180);
+                return;
+            }
+
+            QueueStore.setPendingCaptureTitle(this, quickAddTitle);
+            quickAddStartedAt = now;
+            quickAddStage = QA_WAIT_AMAZON_SHARE_PANEL;
+            boolean clicked = preview.shareNode != null && (clickNode(preview.shareNode) || tapNode(preview.shareNode));
+            recycleQuickAddPreview(preview);
+            if (!clicked) clicked = tapAtFraction(0.50f, 0.78f);
+            if (!clicked) {
+                resetQuickAdd("Couldn't press Share on the Amazon preview.", false);
+                return;
+            }
+            handler.postDelayed(() -> scheduleQuickAdd(0), 500);
+            return;
+        }
+
+        if (quickAddStage == QA_WAIT_AMAZON_SHARE_PANEL) {
+            boolean sharePanel = treeContains(root, "share this product with friends");
+            AccessibilityNodeInfo more = findNodeByText(root, "more", true);
+            root.recycle();
+            if (!sharePanel) {
+                handler.postDelayed(() -> scheduleQuickAdd(0), 350);
+                return;
+            }
+            boolean clicked = more != null && (clickNode(more) || tapNode(more));
+            if (more != null) try { more.recycle(); } catch (Exception ignored) {}
+            if (!clicked) clicked = tapAtFraction(0.82f, 0.89f);
+            if (clicked) {
+                quickAddStage = QA_WAIT_SYSTEM_SHARE;
+                handler.postDelayed(() -> scheduleQuickAdd(0), 550);
+            } else {
+                resetQuickAdd("Couldn't press More on Amazon's share panel.", false);
+            }
+            return;
+        }
+
+        if (quickAddStage == QA_WAIT_SYSTEM_SHARE) {
+            AccessibilityNodeInfo target = findInviteHelperShareTarget(root);
+            root.recycle();
+            if (target == null) {
+                handler.postDelayed(() -> scheduleQuickAdd(0), 350);
+                return;
+            }
+            boolean clicked = clickNode(target) || tapNode(target);
+            try { target.recycle(); } catch (Exception ignored) {}
+            if (!clicked) {
+                resetQuickAdd("Couldn't select Add to Invite Helper.", false);
+                return;
+            }
+            quickAddStage = QA_WAIT_RETURN;
+            handler.postDelayed(this::finishQuickAddReturn, 1250);
+            return;
+        }
+
+        // WAIT_RETURN is completed by the delayed check above.
         root.recycle();
-
-        if (capture.shareNode == null || capture.productTitle == null || capture.productTitle.trim().isEmpty() || !capture.looksLikeProductPage) {
-            recycleCapture(capture);
-            return;
-        }
-
-        String key = capture.productTitle.trim().toLowerCase(Locale.ROOT);
-        if (capturedTitlesThisSession.contains(key) || QueueStore.containsLabel(this, capture.productTitle)) {
-            capturedTitlesThisSession.add(key);
-            recycleCapture(capture);
-            return;
-        }
-
-        pendingCaptureTitle = capture.productTitle.trim();
-        QueueStore.setPendingCaptureTitle(this, pendingCaptureTitle);
-        captureShareInProgress = true;
-        captureStartedAt = System.currentTimeMillis();
-        capturedTitlesThisSession.add(key);
-
-        boolean clicked = clickNode(capture.shareNode);
-        if (!clicked) clicked = tapNode(capture.shareNode);
-        recycleCapture(capture);
-
-        if (!clicked) {
-            captureShareInProgress = false;
-            QueueStore.clearPendingCaptureTitle(this);
-            capturedTitlesThisSession.remove(key);
-            pendingCaptureTitle = "";
-            return;
-        }
-
-        // Amazon's own share action provides the canonical/shared product link. Once
-        // the Android share sheet appears, select our receiver automatically.
-        handler.postDelayed(() -> pollShareSheetForHelper(0), 450);
     }
 
-    private CaptureResult scanForOpenedProduct(AccessibilityNodeInfo root) {
-        CaptureResult result = new CaptureResult();
+    private QuickAddPreview scanQuickAddPreview(AccessibilityNodeInfo root) {
+        QuickAddPreview result = new QuickAddPreview();
         Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
         q.add(AccessibilityNodeInfo.obtain(root));
-
         int screenHeight = getResources().getDisplayMetrics().heightPixels;
         int bestTitleScore = Integer.MIN_VALUE;
-        int markerCount = 0;
 
         while (!q.isEmpty()) {
             AccessibilityNodeInfo n = q.removeFirst();
-            boolean visible = isVisibleOnScreen(n);
-            String rawCombined = combinedText(n).replace('\n', ' ').replaceAll("\\s+", " ").trim();
-            String lower = rawCombined.toLowerCase(Locale.ROOT);
-
-            if (visible) {
-                if (containsAny(lower,
-                        "visit the store", "bought in past month", "free returns",
-                        "available by invitation", "request invite", "invitation requested",
-                        "save this item", "add to list", "product safety",
-                        "shipper / seller", "thanks for shopping with us")) {
-                    markerCount++;
-                }
-
-                if (result.shareNode == null && isAmazonShareControl(n, lower)) {
+            if (isVisibleOnScreen(n)) {
+                String combined = combinedText(n).replace('\n', ' ').replaceAll("\\s+", " ").trim();
+                String lower = combined.toLowerCase(Locale.ROOT);
+                if (lower.contains("see all details")) result.hasDetailsButton = true;
+                if (lower.contains("customers say")) result.hasPreviewMarker = true;
+                if (result.shareNode == null && isShareControl(n, lower)) {
                     result.shareNode = AccessibilityNodeInfo.obtain(n);
                 }
-
                 if (n.getText() != null) {
                     String raw = n.getText().toString().replace('\n', ' ').replaceAll("\\s+", " ").trim();
                     if (looksLikeProductTitle(raw)) {
                         Rect bounds = new Rect();
                         n.getBoundsInScreen(bounds);
                         int score = titleScore(raw, bounds, screenHeight);
+                        if (bounds.centerY() < screenHeight * 0.48f) score += 5;
                         if (score > bestTitleScore) {
                             bestTitleScore = score;
                             result.productTitle = raw.length() > 180 ? raw.substring(0, 180).trim() : raw;
@@ -187,22 +222,17 @@ public class InviteAccessibilityService extends AccessibilityService {
                     }
                 }
             }
-
             for (int i = 0; i < n.getChildCount(); i++) {
                 AccessibilityNodeInfo child = n.getChild(i);
                 if (child != null) q.addLast(child);
             }
             n.recycle();
         }
-
-        // Search/result pages may contain product names but normally do not expose the
-        // product-page Share control alongside product-detail markers. Requiring both is
-        // what makes scrolling past products safe.
-        result.looksLikeProductPage = result.shareNode != null && markerCount >= 1;
+        result.isPreview = result.hasDetailsButton && result.shareNode != null;
         return result;
     }
 
-    private boolean isAmazonShareControl(AccessibilityNodeInfo node, String lowerCombined) {
+    private boolean isShareControl(AccessibilityNodeInfo node, String lowerCombined) {
         if (node == null || lowerCombined == null) return false;
         String t = lowerCombined.trim();
         if (!(t.equals("share") || t.equals("share item") || t.startsWith("share "))) return false;
@@ -210,50 +240,16 @@ public class InviteAccessibilityService extends AccessibilityService {
         node.getBoundsInScreen(r);
         if (r.isEmpty()) return false;
         int w = getResources().getDisplayMetrics().widthPixels;
-        int h = getResources().getDisplayMetrics().heightPixels;
-        // Amazon's product-page share icon sits in the upper/right portion of the page.
-        return r.centerX() > (w * 0.55f) && r.centerY() < (h * 0.62f);
+        return r.centerX() > w * 0.30f && r.centerX() < w * 0.70f;
     }
 
-    private void pollShareSheetForHelper(int attempt) {
-        if (!captureShareInProgress) return;
-        if (System.currentTimeMillis() - captureStartedAt > 7000L || attempt >= 12) {
-            performGlobalAction(GLOBAL_ACTION_BACK);
-            QueueStore.clearPendingCaptureTitle(this);
-            captureShareInProgress = false;
-            pendingCaptureTitle = "";
-            Toast.makeText(this, "Couldn't auto-capture that Amazon link. Try Share → Add to Invite Helper once.", Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        AccessibilityNodeInfo target = root == null ? null : findShareTarget(root);
-        if (root != null) root.recycle();
-
-        if (target != null) {
-            boolean clicked = clickNode(target);
-            if (!clicked) clicked = tapNode(target);
-            try { target.recycle(); } catch (Exception ignored) {}
-            if (clicked) {
-                handler.postDelayed(() -> {
-                    captureShareInProgress = false;
-                    pendingCaptureTitle = "";
-                    // ShareReceiverActivity is Theme.NoDisplay and immediately finishes,
-                    // so Android returns the user to the same Amazon product page.
-                }, 1400);
-                return;
-            }
-        }
-        handler.postDelayed(() -> pollShareSheetForHelper(attempt + 1), 450);
-    }
-
-    private AccessibilityNodeInfo findShareTarget(AccessibilityNodeInfo root) {
+    private AccessibilityNodeInfo findInviteHelperShareTarget(AccessibilityNodeInfo root) {
         Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
         q.add(AccessibilityNodeInfo.obtain(root));
         while (!q.isEmpty()) {
             AccessibilityNodeInfo n = q.removeFirst();
-            String lower = combinedText(n).toLowerCase(Locale.ROOT).trim();
-            if (containsAny(lower, "add to invite helper", "amazon invite helper")) {
+            String lower = combinedText(n).toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
+            if (containsAny(lower, "add to invite helper", "amazon invite helper", "add to invi")) {
                 AccessibilityNodeInfo out = AccessibilityNodeInfo.obtain(n);
                 n.recycle();
                 while (!q.isEmpty()) q.removeFirst().recycle();
@@ -268,11 +264,90 @@ public class InviteAccessibilityService extends AccessibilityService {
         return null;
     }
 
-    private void recycleCapture(CaptureResult capture) {
-        if (capture != null && capture.shareNode != null) {
-            try { capture.shareNode.recycle(); } catch (Exception ignored) {}
-            capture.shareNode = null;
+    private AccessibilityNodeInfo findNodeByText(AccessibilityNodeInfo root, String text, boolean exact) {
+        String wanted = text.toLowerCase(Locale.ROOT);
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(root));
+        while (!q.isEmpty()) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            String lower = combinedText(n).toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
+            boolean match = exact ? lower.equals(wanted) : lower.contains(wanted);
+            if (isVisibleOnScreen(n) && match) {
+                AccessibilityNodeInfo out = AccessibilityNodeInfo.obtain(n);
+                n.recycle();
+                while (!q.isEmpty()) q.removeFirst().recycle();
+                return out;
+            }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
         }
+        return null;
+    }
+
+    private boolean treeContains(AccessibilityNodeInfo root, String needle) {
+        String wanted = needle.toLowerCase(Locale.ROOT);
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(root));
+        while (!q.isEmpty()) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            if (isVisibleOnScreen(n) && combinedText(n).toLowerCase(Locale.ROOT).contains(wanted)) {
+                n.recycle();
+                while (!q.isEmpty()) q.removeFirst().recycle();
+                return true;
+            }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
+        }
+        return false;
+    }
+
+    private boolean tapAtFraction(float fx, float fy) {
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        Path p = new Path();
+        p.moveTo(dm.widthPixels * fx, dm.heightPixels * fy);
+        GestureDescription gesture = new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(p, 0, 90))
+                .build();
+        return dispatchGesture(gesture, null, null);
+    }
+
+    private void finishQuickAddReturn() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        boolean amazonShareStillOpen = root != null && treeContains(root, "share this product with friends");
+        if (root != null) root.recycle();
+        if (amazonShareStillOpen) performGlobalAction(GLOBAL_ACTION_BACK);
+        quickAddCooldownUntil = System.currentTimeMillis() + 1000L;
+        quickAddStage = QA_IDLE;
+        quickAddTitle = "";
+        QueueStore.clearPendingCaptureTitle(this);
+    }
+
+    private void resetQuickAdd(String message, boolean closeOneScreen) {
+        if (closeOneScreen) performGlobalAction(GLOBAL_ACTION_BACK);
+        QueueStore.clearPendingCaptureTitle(this);
+        quickAddStage = QA_IDLE;
+        quickAddTitle = "";
+        quickAddCooldownUntil = System.currentTimeMillis() + 900L;
+        if (message != null && !message.isEmpty()) Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
+
+    private void recycleQuickAddPreview(QuickAddPreview preview) {
+        if (preview != null && preview.shareNode != null) {
+            try { preview.shareNode.recycle(); } catch (Exception ignored) {}
+            preview.shareNode = null;
+        }
+    }
+
+    private String shortTitle(String title) {
+        if (title == null) return "Amazon item";
+        String t = title.trim();
+        return t.length() <= 45 ? t : t.substring(0, 42).trim() + "…";
     }
 
     private void scheduleProcess(long delay) {
@@ -379,6 +454,24 @@ public class InviteAccessibilityService extends AccessibilityService {
             return;
         }
 
+        if (scan.thirdParty) {
+            String seller = scan.sellerName == null || scan.sellerName.isEmpty() ? "Third-party seller" : scan.sellerName;
+            markAndAdvance(ProductItem.Status.OTHER_SELLER, "Other seller — skipping", seller);
+            recycleScan(scan);
+            root.recycle();
+            return;
+        }
+
+        // A normal Add to basket / Buy Now page is not an invitation state. If Amazon
+        // does not expose the seller name, record it after a couple of passes rather than
+        // scrolling indefinitely.
+        if (scan.normalPurchase && scrollAttempts >= 2) {
+            markAndAdvance(ProductItem.Status.NO_INVITE_CONTROL, "Normal sale — no invitation control", "Normal sale");
+            recycleScan(scan);
+            root.recycle();
+            return;
+        }
+
         if (scan.available) {
             mark(items, index, ProductItem.Status.AVAILABLE);
             notifyChanged();
@@ -455,6 +548,14 @@ public class InviteAccessibilityService extends AccessibilityService {
 
             boolean visible = isVisibleOnScreen(n);
             if (visible) {
+                if (containsAny(text, "add to basket", "buy now")) {
+                    result.normalPurchase = true;
+                }
+                if (text.contains("shipper / seller") || text.contains("shipper/seller")) {
+                    String seller = extractSellerFromNode(n);
+                    if (seller != null && !seller.isEmpty()) result.sellerName = seller;
+                }
+
                 if (containsAny(text,
                         "thanks for shopping with us",
                         "you purchased this item",
@@ -506,7 +607,66 @@ public class InviteAccessibilityService extends AccessibilityService {
             }
             n.recycle();
         }
+        if (result.normalPurchase && result.sellerName != null && !result.sellerName.isEmpty() &&
+                !result.sellerName.equalsIgnoreCase("Amazon") && !result.sellerName.equalsIgnoreCase("Amazon.co.uk")) {
+            result.thirdParty = true;
+        }
         return result;
+    }
+
+    private String extractSellerFromNode(AccessibilityNodeInfo node) {
+        String raw = subtreeText(node, 24);
+        String seller = parseSeller(raw);
+        if (!seller.isEmpty()) return seller;
+        AccessibilityNodeInfo parent = node == null ? null : node.getParent();
+        if (parent != null) {
+            seller = parseSeller(subtreeText(parent, 40));
+            parent.recycle();
+        }
+        return seller;
+    }
+
+    private String subtreeText(AccessibilityNodeInfo node, int maxNodes) {
+        if (node == null) return "";
+        StringBuilder b = new StringBuilder();
+        Deque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(AccessibilityNodeInfo.obtain(node));
+        int count = 0;
+        while (!q.isEmpty() && count++ < maxNodes) {
+            AccessibilityNodeInfo n = q.removeFirst();
+            String t = combinedText(n).replace('\n', ' ').replaceAll("\\s+", " ").trim();
+            if (!t.isEmpty()) b.append(t).append(' ');
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo child = n.getChild(i);
+                if (child != null) q.addLast(child);
+            }
+            n.recycle();
+        }
+        while (!q.isEmpty()) q.removeFirst().recycle();
+        return b.toString().replaceAll("\\s+", " ").trim();
+    }
+
+    private String parseSeller(String raw) {
+        if (raw == null) return "";
+        String lower = raw.toLowerCase(Locale.ROOT);
+        int idx = lower.indexOf("shipper / seller");
+        int markerLen = "shipper / seller".length();
+        if (idx < 0) {
+            idx = lower.indexOf("shipper/seller");
+            markerLen = "shipper/seller".length();
+        }
+        if (idx < 0) return "";
+        String tail = raw.substring(Math.min(raw.length(), idx + markerLen)).trim();
+        tail = tail.replaceFirst("^[\\s:–—-]+", "");
+        String tailLower = tail.toLowerCase(Locale.ROOT);
+        int cut = tail.length();
+        for (String stop : new String[]{" returns ", " payment ", " secure transaction", " product safety", " save this item"}) {
+            int at = tailLower.indexOf(stop);
+            if (at >= 0 && at < cut) cut = at;
+        }
+        tail = tail.substring(0, cut).replaceAll("\\s+", " ").trim();
+        if (tail.length() > 80) tail = tail.substring(0, 80).trim();
+        return tail;
     }
 
     private boolean looksLikeProductTitle(String raw) {
@@ -519,7 +679,8 @@ public class InviteAccessibilityService extends AccessibilityService {
                 "free returns", "available by invitation", "request invite",
                 "invitation requested", "save this item", "add to list",
                 "product safety", "secure transaction", "returnable within",
-                "shipper / seller", "qualifying items", "terms", "prime")) return false;
+                "shipper / seller", "qualifying items", "customers say", "see all details",
+                "share this product with friends", "terms", "prime")) return false;
         if (s.contains("£") || s.matches("^[0-9.,%+\\- ]+$")) return false;
         return true;
     }
@@ -634,19 +795,28 @@ public class InviteAccessibilityService extends AccessibilityService {
     }
 
     private void markAndAdvance(ProductItem.Status status, String overlayMessage) {
+        markAndAdvance(status, overlayMessage, "");
+    }
+
+    private void markAndAdvance(ProductItem.Status status, String overlayMessage, String note) {
         if (advanceScheduled) return;
         ArrayList<ProductItem> items = QueueStore.load(this);
         int index = QueueStore.getCurrentIndex(this);
-        if (index >= 0 && index < items.size()) mark(items, index, status);
+        if (index >= 0 && index < items.size()) mark(items, index, status, note);
         updateOverlay(overlayMessage);
         notifyChanged();
         advanceAfter(1000);
     }
 
     private void mark(ArrayList<ProductItem> items, int index, ProductItem.Status status) {
+        mark(items, index, status, "");
+    }
+
+    private void mark(ArrayList<ProductItem> items, int index, ProductItem.Status status, String note) {
         ProductItem item = items.get(index);
         item.status = status;
         item.lastChecked = System.currentTimeMillis();
+        item.note = note == null ? "" : note.trim();
         QueueStore.save(this, items);
     }
 
@@ -803,8 +973,10 @@ public class InviteAccessibilityService extends AccessibilityService {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
     }
 
-    private static final class CaptureResult {
-        boolean looksLikeProductPage = false;
+    private static final class QuickAddPreview {
+        boolean isPreview = false;
+        boolean hasDetailsButton = false;
+        boolean hasPreviewMarker = false;
         String productTitle = "";
         AccessibilityNodeInfo shareNode = null;
     }
@@ -813,6 +985,9 @@ public class InviteAccessibilityService extends AccessibilityService {
         boolean available = false;
         boolean requested = false;
         boolean purchased = false;
+        boolean normalPurchase = false;
+        boolean thirdParty = false;
+        String sellerName = "";
         String productTitle = "";
         AccessibilityNodeInfo requestNode = null;
     }

@@ -11,6 +11,7 @@ public class ProductItem {
         AVAILABLE,
         NO_INVITE_CONTROL,
         PURCHASED,
+        OTHER_SELLER,
         ERROR
     }
 
@@ -18,16 +19,18 @@ public class ProductItem {
     public String url;
     public Status status;
     public long lastChecked;
+    public String note;
 
     public ProductItem(String label, String url) {
         this.label = label == null ? "" : label.trim();
         this.url = url == null ? "" : url.trim();
         this.status = Status.PENDING;
         this.lastChecked = 0L;
+        this.note = "";
     }
 
     public String serialize() {
-        return enc(label) + "\t" + enc(url) + "\t" + status.name() + "\t" + lastChecked;
+        return enc(label) + "\t" + enc(url) + "\t" + status.name() + "\t" + lastChecked + "\t" + enc(note == null ? "" : note);
     }
 
     public static ProductItem deserialize(String line) {
@@ -37,6 +40,7 @@ public class ProductItem {
             ProductItem item = new ProductItem(dec(p[0]), dec(p[1]));
             item.status = Status.valueOf(p[2]);
             item.lastChecked = Long.parseLong(p[3]);
+            if (p.length >= 5) item.note = dec(p[4]);
             return item;
         } catch (Exception ignored) {
             return null;

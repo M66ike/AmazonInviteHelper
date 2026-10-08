@@ -39,7 +39,7 @@ public class MainActivity extends Activity {
     private TextView serviceState;
     private TextView runState;
     private EditText input;
-    private CheckBox autoCollectOpened;
+    private CheckBox quickAdd;
     private CheckBox autoRequest;
     private CheckBox stopOnAvailable;
 
@@ -52,7 +52,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        QueueStore.applyV13Defaults(this);
+        QueueStore.applyV14Defaults(this);
         setContentView(buildUi());
         refresh();
     }
@@ -131,13 +131,13 @@ public class MainActivity extends Activity {
         addRow.addView(add, lpWeight());
         root.addView(addRow);
 
-        autoCollectOpened = new CheckBox(this);
-        autoCollectOpened.setText("Automatically add product pages I open in Amazon");
-        autoCollectOpened.setChecked(QueueStore.autoCollectOpened(this));
-        autoCollectOpened.setOnCheckedChangeListener((b, checked) -> QueueStore.setAutoCollectOpened(this, checked));
-        root.addView(autoCollectOpened);
+        quickAdd = new CheckBox(this);
+        quickAdd.setText("Quick Add: long-press a product in Amazon results");
+        quickAdd.setChecked(QueueStore.quickAdd(this));
+        quickAdd.setOnCheckedChangeListener((b, checked) -> QueueStore.setQuickAdd(this, checked));
+        root.addView(quickAdd);
 
-        TextView collectHint = text("Only products you actually open are collected — scrolling past search results will not add them. Amazon's share panel may flash briefly while the helper captures the link.", 12, false);
+        TextView collectHint = text("Long-press a product to open Amazon's preview. The helper then goes through Share → More → Add to Invite Helper, saves the product name and link, closes the share panel and returns you to the results. Simply scrolling past products does nothing.", 12, false);
         collectHint.setPadding(dp(8), 0, dp(8), dp(5));
         root.addView(collectHint);
 
@@ -200,7 +200,7 @@ public class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        TextView footer = text("V1.3 can automatically collect products when you open their Amazon product page. It captures the shared Amazon link and product name, de-duplicates the queue, and does not collect products that you only scroll past.", 12, false);
+        TextView footer = text("V1.4 Quick Add only reacts to an Amazon long-press product preview. Queue scanning also recognises normal sale pages from other sellers so they are recorded and skipped instead of holding up the run.", 12, false);
         footer.setPadding(0, dp(16), 0, 0);
         root.addView(footer);
         return scroller;
@@ -232,6 +232,7 @@ public class MainActivity extends Activity {
         for (ProductItem item : items) {
             item.status = ProductItem.Status.PENDING;
             item.lastChecked = 0L;
+            item.note = "";
         }
         QueueStore.save(this, items);
         QueueStore.setCurrentIndex(this, 0);
@@ -266,7 +267,8 @@ public class MainActivity extends Activity {
             card.addView(nameView);
 
             String checked = item.lastChecked == 0 ? "Never checked" : df.format(new Date(item.lastChecked));
-            TextView state = text(statusText(item.status) + " • " + checked, 12, false);
+            String note = item.note == null || item.note.trim().isEmpty() ? "" : " — " + item.note.trim();
+            TextView state = text(statusText(item.status) + note + " • " + checked, 12, false);
             state.setTextColor(statusColor(item.status));
             card.addView(state);
 
@@ -298,6 +300,7 @@ public class MainActivity extends Activity {
             case AVAILABLE: return "AVAILABLE TO BUY";
             case NO_INVITE_CONTROL: return "No invitation control found";
             case PURCHASED: return "Already purchased";
+            case OTHER_SELLER: return "Other seller / normal sale";
             case ERROR: return "Check failed";
             default: return "Pending";
         }
@@ -308,6 +311,7 @@ public class MainActivity extends Activity {
             case AVAILABLE: return Color.rgb(0, 125, 70);
             case REQUESTED: return Color.rgb(35, 95, 175);
             case PURCHASED: return Color.rgb(95, 95, 95);
+            case OTHER_SELLER: return Color.rgb(105, 70, 145);
             case ERROR: return Color.rgb(185, 35, 35);
             case NO_INVITE_CONTROL: return Color.DKGRAY;
             default: return Color.rgb(130, 90, 0);
